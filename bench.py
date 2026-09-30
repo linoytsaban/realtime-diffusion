@@ -54,6 +54,7 @@ def main():
     parser.add_argument("--no-fuse", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--text-encoder-device", default="cpu")
+    parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--max-memory-gb", type=float, help="cap GPU memory to emulate a smaller card")
     parser.add_argument("--out", default="out.mp4")
     args = parser.parse_args()
@@ -63,7 +64,7 @@ def main():
         torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
     stream = StreamQwen(
         args.size, args.size, start_node=args.start_node, fuse_lora=not args.no_fuse,
-        text_encoder_device=args.text_encoder_device,
+        text_encoder_device=args.text_encoder_device, fp8=args.fp8,
     )  # fmt: skip
     if args.compile:
         stream.transformer.compile(fullgraph=False, dynamic=False)
@@ -85,7 +86,7 @@ def main():
 
     nfe = len(stream.sigmas) - 1
     total = np.sum([np.median(v) for v in stages.values()])
-    print(f"{args.size}px, {nfe} NFE, fused={not args.no_fuse}, compile={args.compile}")
+    print(f"{args.size}px, {nfe} NFE, fused={not args.no_fuse}, compile={args.compile}, fp8={args.fp8}")
     print(f"set_prompt (once per prompt): {prompt_ms:.0f} ms")
     for name, values in stages.items():
         print(f"  {name:8s} {np.median(values):7.1f} ms (median)")

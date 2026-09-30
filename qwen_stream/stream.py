@@ -25,6 +25,7 @@ class StreamQwen:
         seed: int = 0,
         device: str = "cuda",
         text_encoder_device: str = "cpu",
+        fp8: bool = False,
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
@@ -38,6 +39,10 @@ class StreamQwen:
         self.transformer = self.pipe.transformer.to(device)
         # D3: the turbo LoRA is fused by default, trading a little precision for no per-layer LoRA matmuls.
         apply_lora(self.transformer, hf_hub_download(*TURBO_LORA), fuse=fuse_lora)
+        if fp8:  # D10: FP8 weights and activations (Ada, Hopper, Blackwell); needs the LoRA fused first
+            from torchao.quantization import PerRow, float8_dynamic_activation_float8_weight, quantize_
+
+            quantize_(self.transformer.transformer_blocks, float8_dynamic_activation_float8_weight(granularity=PerRow()))
         self.vae = TinyVAE.from_pretrained().to(device, dtype)
 
         # D2: the turbo schedule, time-shifted for this resolution exactly as the pipeline would, entered mid-way.

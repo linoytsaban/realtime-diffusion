@@ -77,6 +77,14 @@ Qwen3-VL-8B (17.5 GB) runs only when the prompt changes. On CPU a prompt change 
 peak drops from 30.4 to 14.0 GiB, so it fits a 24 GB RTX 4090 (checked with `bench.py --max-memory-gb 24`).
 On DGX Spark (unified memory) `text_encoder_device="cuda"` costs nothing extra. Next: a small cache of recent prompts.
 
+**D10. Optional FP8 DiT (`fp8=True`): torchao dynamic FP8 activations + FP8 weights, per-row scales, on the 32 blocks.**
+Needs FP8 tensor cores (Ada/RTX 4090, Hopper, Blackwell). Applied after the LoRA is fused (D3).
+On one frame the output differs from bf16 by a mean of 1.4/255 and is visually indistinguishable.
+Weights drop from 13.3 to 6.8 GiB. Speed on H100 only improves ~10% (compiled 137 -> 123 ms/frame): launch overhead,
+not GEMMs, dominates until O1. The halved weight traffic should matter more on bandwidth-bound Spark.
+Load-time peak is still 14 GiB, because the model is loaded in bf16 first. Loading pre-quantized weights would fix
+that for 16 GB cards.
+
 ## Measurements (H100 PCIe, 512px, fused LoRA, 48 frames of a 24 fps clip)
 
 | config | encode | denoise | decode | total | FPS |
@@ -84,6 +92,10 @@ On DGX Spark (unified memory) `text_encoder_device="cuda"` costs nothing extra. 
 | 2 NFE, eager | 1.7 ms | 110 ms | 1.8 ms | 113 ms | 8.8 |
 | 3 NFE, eager | 1.7 ms | 165 ms | 1.8 ms | 168 ms | 5.9 |
 | 3 NFE, `torch.compile` | 2.6 ms | 132 ms | 2.7 ms | 138 ms | 7.3 |
+| 3 NFE, compile + FP8, text encoder on CPU, 24 GB cap | 2.5 ms | 123 ms | 2.7 ms | 128 ms | 7.8 |
+
+With `--compile`, the reported `set_prompt` time includes compile warmup (minutes), because the first compiled pass
+runs there.
 
 With the text encoder on the GPU, peak memory is 30.4 GiB (14 GB DiT plus 17.5 GB text encoder). With D9 it is
 14.0 GiB, and the speed is unchanged (6.0 FPS eager, 3 NFE, under a 24 GB cap).
