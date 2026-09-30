@@ -24,15 +24,18 @@ class StreamQwen:
         fuse_lora: bool = True,
         seed: int = 0,
         device: str = "cuda",
+        text_encoder_device: str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        self.device, self.dtype = device, dtype
+        self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
         self.latent_hw = (height // 16, width // 16)
         num_tokens = self.latent_hw[0] * self.latent_hw[1]
 
         # D1: the full VAE is never loaded, TAEQI2.1 does both ends.
-        self.pipe = QwenImage21Pipeline.from_pretrained(BASE_MODEL, vae=None, torch_dtype=dtype).to(device)
-        self.transformer = self.pipe.transformer
+        self.pipe = QwenImage21Pipeline.from_pretrained(BASE_MODEL, vae=None, torch_dtype=dtype)
+        # D9: only the DiT lives on the GPU by default; the 8B text encoder runs once per prompt wherever it is put.
+        self.pipe.text_encoder.to(text_encoder_device)
+        self.transformer = self.pipe.transformer.to(device)
         # D3: the turbo LoRA is fused by default, trading a little precision for no per-layer LoRA matmuls.
         apply_lora(self.transformer, hf_hub_download(*TURBO_LORA), fuse=fuse_lora)
         self.vae = TinyVAE.from_pretrained().to(device, dtype)
@@ -59,7 +62,8 @@ class StreamQwen:
     @torch.no_grad()
     def set_prompt(self, prompt: str):
         """D6: encode the prompt and prefill its K/V once; every later step of every frame reuses them."""
-        embeds, _, image_pad_mask = self.pipe.encode_prompt(prompt, device=self.device)
+        embeds, _, image_pad_mask = self.pipe.encode_prompt(prompt, device=self.text_encoder_device)
+        embeds, image_pad_mask = embeds.to(self.device), image_pad_mask.to(self.device)
         num_slots = self.noise.shape[1] // 4  # the transformer maps each image slot to 2x2 latent tokens
         self.prompt_embeds = embeds
         self.img_mask = torch.cat([image_pad_mask, image_pad_mask.new_ones(1, num_slots)], dim=1)

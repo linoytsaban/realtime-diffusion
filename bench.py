@@ -53,10 +53,18 @@ def main():
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--no-fuse", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--text-encoder-device", default="cpu")
+    parser.add_argument("--max-memory-gb", type=float, help="cap GPU memory to emulate a smaller card")
     parser.add_argument("--out", default="out.mp4")
     args = parser.parse_args()
 
-    stream = StreamQwen(args.size, args.size, start_node=args.start_node, fuse_lora=not args.no_fuse)
+    if args.max_memory_gb:
+        total = torch.cuda.get_device_properties(0).total_memory / 2**30
+        torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
+    stream = StreamQwen(
+        args.size, args.size, start_node=args.start_node, fuse_lora=not args.no_fuse,
+        text_encoder_device=args.text_encoder_device,
+    )  # fmt: skip
     if args.compile:
         stream.transformer.compile(fullgraph=False, dynamic=False)
     _, prompt_ms = timed(stream.set_prompt, args.prompt)

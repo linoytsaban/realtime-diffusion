@@ -72,6 +72,11 @@ on this box). Batched prompts of different lengths would need the mask back.
 A frame is skipped with probability `max(0, (cos_sim - t) / (1 - t))` against the last processed frame.
 The test video moves continuously, so this is untested until there is a live camera loop.
 
+**D9. Only the DiT lives on the GPU; the text encoder stays on CPU by default (`text_encoder_device`).**
+Qwen3-VL-8B (17.5 GB) runs only when the prompt changes. On CPU a prompt change takes 1.3 s instead of 0.3 s, and GPU
+peak drops from 30.4 to 14.0 GiB, so it fits a 24 GB RTX 4090 (checked with `bench.py --max-memory-gb 24`).
+On DGX Spark (unified memory) `text_encoder_device="cuda"` costs nothing extra. Next: a small cache of recent prompts.
+
 ## Measurements (H100 PCIe, 512px, fused LoRA, 48 frames of a 24 fps clip)
 
 | config | encode | denoise | decode | total | FPS |
@@ -80,7 +85,8 @@ The test video moves continuously, so this is untested until there is a live cam
 | 3 NFE, eager | 1.7 ms | 165 ms | 1.8 ms | 168 ms | 5.9 |
 | 3 NFE, `torch.compile` | 2.6 ms | 132 ms | 2.7 ms | 138 ms | 7.3 |
 
-Peak memory is 30.4 GiB: 14 GB DiT plus 17.5 GB text encoder. That does not fit a 4090.
+With the text encoder on the GPU, peak memory is 30.4 GiB (14 GB DiT plus 17.5 GB text encoder). With D9 it is
+14.0 GiB, and the speed is unchanged (6.0 FPS eager, 3 NFE, under a 24 GB cap).
 
 Profile of one cached pass (eager, ~48 ms GPU):
 - GEMMs take 28 ms, i.e. ~500 TFLOP/s: already about 2/3 of bf16 peak on this card.
@@ -101,11 +107,8 @@ Profile of one cached pass (eager, ~48 ms GPU):
   - NVFP4 on Blackwell (RTX Pro 6000, Spark).
   - Halves or quarters both the GEMM time and the 14 GB of weights; on Spark, bandwidth is the limit.
   - Needs a quality check against bf16 at 3 NFE.
-- **O3. Text encoder off the hot GPU budget.**
-  - It is only used when the prompt changes.
-  - Options: offload to CPU and accept a slower prompt change, quantize to 4-bit (~5 GB), or keep an embedding
-    cache of prompts.
-  - Required for 24 GB cards.
+- **O3. ~~Text encoder off the GPU budget~~** done as D9. Still open: 4-bit text encoder for faster prompt changes on
+  small cards.
 - **O4. Resolution and token count as a user-facing setting.** 384px (576 tokens) is about 0.55x the compute of 512.
   It is the most portable lever.
 - **O5. 1–2 step student.**
