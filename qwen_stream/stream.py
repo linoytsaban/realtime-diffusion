@@ -7,6 +7,7 @@ from diffusers.models.transformers.transformer_qwenimage21 import QwenImage21KVC
 from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_shift
 from huggingface_hub import hf_hub_download
 
+from .fast import CachedDenoiser
 from .lora import apply_lora
 from .tiny_vae import TinyVAE
 
@@ -26,9 +27,10 @@ class StreamQwen:
         device: str = "cuda",
         text_encoder_device: str = "cpu",
         fp8: bool = False,
+        compile: bool = False,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
+        self.device, self.text_encoder_device, self.dtype, self.compile = device, text_encoder_device, dtype, compile
         self.latent_hw = (height // 16, width // 16)
         num_tokens = self.latent_hw[0] * self.latent_hw[1]
 
@@ -74,8 +76,12 @@ class StreamQwen:
         self.img_mask = torch.cat([image_pad_mask, image_pad_mask.new_ones(1, num_slots)], dim=1)
         self.kv_cache.clear()
         self._transformer(self.noise, self.sigmas[0], kv_cache_mode="extract")
+        # D11: every later step runs the lean target-only forward on the cached prefix.
+        denoiser = CachedDenoiser(self.transformer, self.img_mask, self.img_shapes, self.kv_cache)
+        self.step = torch.compile(denoiser.__call__, fullgraph=True, dynamic=False) if self.compile else denoiser
 
-    def _transformer(self, x, sigma, kv_cache_mode="cached"):
+    def _transformer(self, x, sigma, kv_cache_mode):
+        """The stock diffusers forward; used only for the prefill."""
         return self.transformer(
             hidden_states=x.to(self.dtype),
             timestep=sigma.view(1).to(self.dtype),
@@ -102,7 +108,7 @@ class StreamQwen:
         s0 = self.sigmas[0]
         x = (1 - s0) * latents + s0 * self.noise
         for s, s_next in zip(self.sigmas[:-1], self.sigmas[1:]):
-            x = x + (s_next - s) * self._transformer(x, s).float()
+            x = x + (s_next - s) * self.step(x.to(self.dtype), s.view(1).to(self.dtype)).float()
         return x
 
     @torch.no_grad()

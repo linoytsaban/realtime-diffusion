@@ -64,10 +64,8 @@ def main():
         torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
     stream = StreamQwen(
         args.size, args.size, start_node=args.start_node, fuse_lora=not args.no_fuse,
-        text_encoder_device=args.text_encoder_device, fp8=args.fp8,
+        text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile,
     )  # fmt: skip
-    if args.compile:
-        stream.transformer.compile(fullgraph=False, dynamic=False)
     _, prompt_ms = timed(stream.set_prompt, args.prompt)
     frames = read_frames(args.video, args.size, args.frames)
 

@@ -85,6 +85,16 @@ not GEMMs, dominates until O1. The halved weight traffic should matter more on b
 Load-time peak is still 14 GiB, because the model is loaded in bf16 first. Loading pre-quantized weights would fix
 that for 16 GB cards.
 
+**D11. Lean target-only forward for every cached step (`fast.py`).**
+`set_prompt` still uses the stock diffusers forward once, to prefill the prefix K/V. After that, each step runs
+`CachedDenoiser`. It precomputes the target-token rotary table (as real cos/sin) and the per-layer prefix K/V once,
+then runs `img_in` -> one shared modulation (all 32 blocks share it) -> 32 blocks -> `norm_out` / `proj_out`.
+There is no data-dependent indexing and no host sync, so it compiles with `fullgraph=True`.
+- **Parity:** vs the diffusers cached forward, 0.6% relative difference (bf16 rounding over 32 layers).
+- **Cost:** about 50 lines that duplicate the block math. It has to track upstream changes to the 2.1 block.
+- **Prompt length:** compile is specialized to the prompt's token count, so a prompt of a new length triggers a
+  recompile (~30 s). Fix: pad prompts to a few bucket lengths with a key mask.
+
 ## Measurements (H100 PCIe, 512px, fused LoRA, 48 frames of a 24 fps clip)
 
 | config | encode | denoise | decode | total | FPS |
@@ -93,6 +103,34 @@ that for 16 GB cards.
 | 3 NFE, eager | 1.7 ms | 165 ms | 1.8 ms | 168 ms | 5.9 |
 | 3 NFE, `torch.compile` | 2.6 ms | 132 ms | 2.7 ms | 138 ms | 7.3 |
 | 3 NFE, compile + FP8, text encoder on CPU, 24 GB cap | 2.5 ms | 123 ms | 2.7 ms | 128 ms | 7.8 |
+
+| lean forward (D11), eager, 24 GB cap | 3.5 ms | 171 ms | 3.6 ms | 178 ms | 5.6 |
+| lean forward, compiled, 24 GB cap | 2.6 ms | 127 ms | 2.8 ms | 132 ms | 7.6 |
+| **lean forward, compiled + FP8, 24 GB cap** | 2.7 ms | 98 ms | 2.9 ms | 104 ms | **9.6** |
+
+Per transformer pass (512px, 1024 tokens):
+
+| path | ms/NFE |
+|---|---|
+| diffusers cached, eager | 55 |
+| lean, eager | 57 |
+| lean, eager + CUDA graph | 55 |
+| lean, compiled (+/- CUDA graph) | 42 |
+| lean, compiled, FP8 | 31 |
+
+**CUDA graphs do not help here.** The earlier "CPU launch bound" reading was wrong: graph replay is as slow as eager,
+so the time is GPU kernels. Compile helps because it fuses the ~25 ms of elementwise kernels (norms, rope, modulation,
+casts) down to under 5 ms.
+After compile, a bf16 pass is 37 ms of GPU time:
+- GEMMs: 28.7 ms (77%)
+- attention: 3.6 ms
+- everything else: under 5 ms
+
+That is near the bf16 limit of this card. The remaining levers are FP8/FP4 GEMMs (D10), fewer tokens (O4) and fewer
+steps (O5).
+
+**Quality is the open problem, not speed.** At start node 0.75, faces and fine structure get mushy with a generic
+style prompt (see D4).
 
 With `--compile`, the reported `set_prompt` time includes compile warmup (minutes), because the first compiled pass
 runs there.
@@ -107,13 +145,9 @@ Profile of one cached pass (eager, ~48 ms GPU):
 
 ## Optimization backlog (roughly in priority order)
 
-- **O1. Lean decode-only forward plus CUDA graphs.**
-  - The diffusers forward recomputes token metadata on every call (`nonzero`, host-to-device `torch.tensor`,
-    `repeat_interleave`, rotary embeddings). That makes CPU/GPU syncs, and CUDA-graph capture fails
-    (`compile(mode="max-autotune")` crashes during capture).
-  - In cached mode all of it is constant per prompt and resolution. Precompute it once and run a minimal loop over
-    the 32 blocks.
-  - Portable to every target, and it matters most on weak host CPUs (Spark's ARM cores).
+- **O1. ~~Lean decode-only forward~~** done as D11.
+  - CUDA graphs measured no gain on H100. They may still matter on hosts with weak CPUs (Spark's ARM cores), and the
+    lean forward is capturable if needed.
 - **O2. Low-precision DiT, chosen per GPU generation.**
   - FP8 weights and activations on Ada, Hopper and Blackwell. That covers the 4090.
   - NVFP4 on Blackwell (RTX Pro 6000, Spark).

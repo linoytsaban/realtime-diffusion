@@ -22,11 +22,11 @@ out = stream(frame)  # (H, W, 3) uint8 CUDA tensor in and out
 ## Benchmark
 
 ```bash
-python bench.py --video input.mp4 --frames 48 [--start-node 0.75] [--compile] [--no-fuse] --out out.mp4
+python bench.py --video input.mp4 --frames 48 [--start-node 0.75] [--compile] [--fp8] [--max-memory-gb 24] --out out.mp4
 ```
 
 Prints per-stage latency and writes an `input | output` side-by-side video.
-Current numbers: 7.3 FPS at 512px with 3 steps on an H100 PCIe (see DESIGN.md).
+Current numbers: 9.6 FPS at 512px with 3 steps (FP8, compiled) on an H100 PCIe within a 24 GB budget (see DESIGN.md).
 
 ## Requirements
 
