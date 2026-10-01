@@ -28,9 +28,21 @@ python bench.py --video input.mp4 --frames 48 [--start-node 0.75] [--compile] [-
 Prints per-stage latency and writes an `input | output` side-by-side video.
 Current numbers: 9.6 FPS at 512px with 3 steps (FP8, compiled) on an H100 PCIe within a 24 GB budget (see DESIGN.md).
 
+## Live camera demo
+
+```bash
+python live.py --fp8 --compile   # ~3 min warmup, then prints http://127.0.0.1:8765/?token=...
+```
+
+Browsers only allow camera access on https or localhost. From a remote box, either forward the port
+(`ssh -L 8765:127.0.0.1:8765 box`) or put a tunnel in front, e.g.
+`touch empty.yml && cloudflared tunnel --config empty.yml --url http://127.0.0.1:8765`. The empty config keeps
+cloudflared from inheriting a system `config.yml`, whose catch-all ingress rule would 404 every request.
+
 ## Requirements
 
-`torch`, `diffusers` with Qwen-Image 2.1 (git `main`), `transformers>=5`, `safetensors`, `av`.
+`torch`, `torchvision`, `diffusers` with Qwen-Image 2.1 (git `main`), `transformers>=5`, `safetensors`, `av`;
+`torchao` for `--fp8`; `fastapi` + `uvicorn` for the live demo.
 peft is not required.
 
 Licenses: Qwen-Image 2.1 and the Viggle turbo LoRA are under the Qwen Research License (non-commercial).

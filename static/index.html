@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwen-stream live</title>
+<style>
+  :root { --bg: #111; --fg: #eee; --muted: #999; --panel: #1c1c1c; --accent: #7cc4ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  .views { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; max-width: 1100px; }
+  figure { margin: 0; }
+  figcaption { color: var(--muted); margin-bottom: 4px; }
+  video, img { width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--panel); border-radius: 6px; transform: scaleX(-1); }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; max-width: 1100px; }
+  input[type=text] { flex: 1 1 320px; padding: 8px; background: var(--panel); color: var(--fg); border: 1px solid #333; border-radius: 6px; }
+  select, button { padding: 8px; background: var(--panel); color: var(--fg); border: 1px solid #333; border-radius: 6px; }
+  label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; max-width: 1100px; }
+  .stat { background: var(--panel); border-radius: 6px; padding: 8px; }
+  .stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; color: var(--accent); }
+  .stat span { color: var(--muted); font-size: 12px; }
+  #status { color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="views">
+  <figure><figcaption>Camera</figcaption><video id="video" autoplay playsinline muted></video></figure>
+  <figure><figcaption>Qwen-Image 2.1 stream</figcaption><img id="output" alt=""></figure>
+</div>
+
+<div class="controls">
+  <input id="prompt" type="text" value="a watercolor painting, soft pastel colors, paper texture">
+  <button id="apply">Apply prompt</button>
+  <select id="strength" title="img2img start node (D4)">
+    <option value="0.5">subtle (2 steps)</option>
+    <option value="0.75" selected>medium (3 steps)</option>
+    <option value="0.875">strong (4 steps)</option>
+  </select>
+  <label><input id="filter" type="checkbox"> skip similar frames</label>
+</div>
+
+<div class="stats">
+  <div class="stat"><b id="fps">-</b><span>output FPS (browser)</span></div>
+  <div class="stat"><b id="gpu">-</b><span>GPU ms / frame</span></div>
+  <div class="stat"><b id="latency">-</b><span>camera-to-screen ms</span></div>
+  <div class="stat"><b id="denoise">-</b><span>denoise ms</span></div>
+  <div class="stat"><b id="vae">-</b><span>tiny VAE enc+dec ms</span></div>
+  <div class="stat"><b id="jpeg">-</b><span>JPEG enc+dec ms</span></div>
+</div>
+<div id="status">connecting...</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const token = new URLSearchParams(location.search).get("token");
+const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?token=${token}`);
+ws.binaryType = "blob";
+const canvas = document.createElement("canvas");
+const sentAt = [];             // send times of frames in flight, oldest first
+const MAX_IN_FLIGHT = 2;       // hides network round trip; the server keeps at most one frame waiting
+let size = 512, outputTimes = [], lastStats = null, previousUrl = null;
+
+const avg = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+const recent = { gpu: [], latency: [], denoise: [], vae: [], jpeg: [] };
+function track(key, value) { const xs = recent[key]; xs.push(value); if (xs.length > 20) xs.shift(); $(key).textContent = avg(xs).toFixed(0); }
+
+function sendFrame() {
+  const video = $("video");
+  if (ws.readyState !== WebSocket.OPEN || !video.videoWidth || sentAt.length >= MAX_IN_FLIGHT) return;
+  const side = Math.min(video.videoWidth, video.videoHeight);  // center crop to a square
+  canvas.getContext("2d").drawImage(video, (video.videoWidth - side) / 2, (video.videoHeight - side) / 2, side, side, 0, 0, size, size);
+  sentAt.push(performance.now());
+  canvas.toBlob((blob) => ws.send(blob), "image/jpeg", 0.85);
+}
+
+ws.onmessage = (event) => {
+  if (typeof event.data === "string") {
+    const message = JSON.parse(event.data);
+    if (message.size) {
+      size = canvas.width = canvas.height = message.size;
+      // the server keeps its state across connections, so sync it to what this page shows
+      configure({ prompt: $("prompt").value, start_node: $("strength").value, filter: $("filter").checked });
+      $("status").textContent = "streaming"; sendFrame(); sendFrame();
+    }
+    else if (message.configured) $("status").textContent = `applied: ${message.configured.join(", ")}`;
+    else lastStats = message;
+    return;
+  }
+  const now = performance.now();
+  track("latency", now - sentAt.shift());
+  outputTimes.push(now); outputTimes = outputTimes.filter((t) => now - t < 2000);
+  $("fps").textContent = (outputTimes.length / 2).toFixed(1);
+  if (lastStats && !lastStats.skipped) {
+    track("denoise", lastStats.denoise);
+    track("vae", lastStats.encode + lastStats.decode);
+    track("jpeg", lastStats.jpeg);
+    track("gpu", lastStats.encode + lastStats.denoise + lastStats.decode + lastStats.jpeg);
+  }
+  if (previousUrl) URL.revokeObjectURL(previousUrl);
+  $("output").src = previousUrl = URL.createObjectURL(event.data);
+  sendFrame();
+};
+ws.onclose = (event) => { $("status").textContent = `disconnected ${event.reason || ""}`; };
+
+const configure = (settings) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(settings));
+$("apply").onclick = () => { $("status").textContent = "encoding prompt..."; configure({ prompt: $("prompt").value }); };
+$("prompt").onkeydown = (event) => event.key === "Enter" && $("apply").click();
+$("strength").onchange = () => configure({ start_node: $("strength").value });
+$("filter").onchange = () => configure({ filter: $("filter").checked });
+
+navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: false })
+  .then((media) => { $("video").srcObject = media; $("video").onloadeddata = () => { sendFrame(); sendFrame(); }; })
+  .catch((error) => { $("status").textContent = `camera error: ${error.message}`; });
+</script>
+</body>
+</html>

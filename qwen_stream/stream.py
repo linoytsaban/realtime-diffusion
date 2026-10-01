@@ -30,7 +30,7 @@ class StreamQwen:
         compile: bool = False,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        self.device, self.text_encoder_device, self.dtype, self.compile = device, text_encoder_device, dtype, compile
+        self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
         self.latent_hw = (height // 16, width // 16)
         num_tokens = self.latent_hw[0] * self.latent_hw[1]
 
@@ -61,6 +61,9 @@ class StreamQwen:
 
         self.img_shapes = [[(1, *self.latent_hw)]]
         self.kv_cache = QwenImage21KVCache(len(self.transformer.transformer_blocks))
+        # D11: every cached step runs this lean target-only forward; compiled once for the stream's lifetime.
+        self.denoiser = CachedDenoiser(self.transformer)
+        self.step = torch.compile(self.denoiser.__call__, fullgraph=True, mode="reduce-overhead") if compile else self.denoiser
 
     def set_start_node(self, node: float):
         """D4: where img2img enters the schedule (a raw turbo node). Higher = more prompt, less input frame, more NFE."""
@@ -76,9 +79,7 @@ class StreamQwen:
         self.img_mask = torch.cat([image_pad_mask, image_pad_mask.new_ones(1, num_slots)], dim=1)
         self.kv_cache.clear()
         self._transformer(self.noise, self.sigmas[0], kv_cache_mode="extract")
-        # D11: every later step runs the lean target-only forward on the cached prefix.
-        denoiser = CachedDenoiser(self.transformer, self.img_mask, self.img_shapes, self.kv_cache)
-        self.step = torch.compile(denoiser.__call__, fullgraph=True, dynamic=False) if self.compile else denoiser
+        self.denoiser.set_prefix(self.img_mask, self.img_shapes, self.kv_cache)
 
     def _transformer(self, x, sigma, kv_cache_mode):
         """The stock diffusers forward; used only for the prefill."""

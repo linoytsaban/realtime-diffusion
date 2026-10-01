@@ -92,8 +92,32 @@ then runs `img_in` -> one shared modulation (all 32 blocks share it) -> 32 block
 There is no data-dependent indexing and no host sync, so it compiles with `fullgraph=True`.
 - **Parity:** vs the diffusers cached forward, 0.6% relative difference (bf16 rounding over 32 layers).
 - **Cost:** about 50 lines that duplicate the block math. It has to track upstream changes to the 2.1 block.
-- **Prompt length:** compile is specialized to the prompt's token count, so a prompt of a new length triggers a
-  recompile (~30 s). Fix: pad prompts to a few bucket lengths with a key mask.
+- **One instance for the stream's lifetime.** A prompt change swaps the prefix tensors (`set_prefix`).
+  - torch.compile's automatic dynamic shapes generalize the prefix length after the second length seen.
+  - Measured: the first two prompt lengths each compile once (~1 min). After that, a new length costs nothing extra,
+    and steady speed is unchanged (~101 ms/frame).
+  - `live.py` warms up with two lengths at startup.
+- **Compiled with `mode="reduce-overhead"` (CUDA graphs).** Single-threaded, graphs gain nothing (30.4 vs 30.7 ms per
+  pass with FP8). But with one busy Python thread competing for the GIL, the graph-less compiled pass collapses to
+  2617 ms, while the graphed one holds at 47 ms. A server always has other threads, so graphs are required.
+- **The graphs re-read swapped prefix tensors.** Replacing the prefix K/V with zero tensors of the same shape changes
+  the compiled output by 101%. It then matches eager with the same zero K/V to 2.6% (FP8 rounding), so a prompt swap
+  cannot leave a stale baked-in prefix.
+
+**D12. Live server (`live.py` + `static/index.html`): newest frame only, two frames in flight, one GPU thread.**
+- **Newest frame wins.** The browser sends JPEG frames over a WebSocket. The server keeps only the newest frame and
+  the newest settings, so a slow step drops frames instead of building latency.
+- **Two frames in flight.** The page sends the next frame when a result arrives, with up to 2 frames in flight. One
+  frame hides the network round trip while the other is on the GPU. Through the cloudflared tunnel this measured
+  9.5 FPS, vs 5.7 FPS with one frame in flight (~67 ms round trip).
+- **One dedicated GPU thread.** It runs warmup, prompt changes and every frame. CUDA graphs in torch.compile are
+  recorded per thread: running frames on `asyncio.to_thread`'s pool hung on the first frame.
+- **JPEG on the GPU.** `torchvision.io` decodes and encodes on the GPU (~1 ms per frame in total).
+- **Single user, by design.** `StreamQwen` holds one prompt cache. A new connection takes over from the old one
+  (page reloads, a second tab), and the page re-sends its prompt and strength on connect.
+- **Gated.** The page sits behind a random URL token, because it is exposed through a public quick tunnel.
+- **Measured locally, end to end:** 9.2 FPS with 103 ms of GPU work per frame, flat from 1 to 3 frames in flight.
+  Before the single GPU thread, GIL contention pushed it from 104 to 129 ms.
 
 ## Measurements (H100 PCIe, 512px, fused LoRA, 48 frames of a 24 fps clip)
 
@@ -145,9 +169,8 @@ Profile of one cached pass (eager, ~48 ms GPU):
 
 ## Optimization backlog (roughly in priority order)
 
-- **O1. ~~Lean decode-only forward~~** done as D11.
-  - CUDA graphs measured no gain on H100. They may still matter on hosts with weak CPUs (Spark's ARM cores), and the
-    lean forward is capturable if needed.
+- **O1. ~~Lean decode-only forward + CUDA graphs~~** done as D11. Graphs are what keep the server stable under GIL
+  contention; they should also help hosts with weak CPUs (Spark's ARM cores).
 - **O2. Low-precision DiT, chosen per GPU generation.**
   - FP8 weights and activations on Ada, Hopper and Blackwell. That covers the 4090.
   - NVFP4 on Blackwell (RTX Pro 6000, Spark).
@@ -163,7 +186,7 @@ Profile of one cached pass (eager, ~48 ms GPU):
 - **O6. Temporal consistency.** Try latent blending with the previous output, motion-aware start sigma
   (StreamDiffusionV2), or feature banks (StreamV2V).
 - **O7. Serving.**
-  - Threaded input/output queues (StreamDiffusion).
+  - The local live server is D12.
   - On ZeroGPU the GPU is attached per call, so frames have to be processed in chunks per call rather than in a
     persistent loop.
 - **O8. Multi-GPU pipeline parallelism** (StreamDiffusionV2): split the blocks across GPUs, with steps in flight.
