@@ -1,32 +1,35 @@
 # qwen-stream
 
-StreamDiffusion-style real-time img2img with Qwen-Image 2.1: a video or camera stream goes in, a restyled stream
+StreamDiffusion-style real-time editing with Qwen-Image 2.1: a video or camera stream goes in, an edited stream
 comes out. Prototype stage. Every design choice and the optimization backlog are in [DESIGN.md](DESIGN.md).
 
 ## How it works
 
-- The frame is encoded by [TAEQI2.1](https://huggingface.co/madebyollin/taeqi2_1), noised to a mid-schedule sigma, and
-  denoised in 3 steps by Qwen-Image 2.1 with the
-  [Viggle turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) LoRA fused in.
-- It is decoded again by TAEQI2.1.
-- The prompt is encoded and its K/V prefilled once, then reused for every frame.
+- **Edit mode (default).** Each frame is encoded by [TAEQI2.1](https://huggingface.co/madebyollin/taeqi2_1) and given
+  to Qwen-Image 2.1 as the condition image of an edit instruction. The output is denoised from fixed noise in 4-6 steps
+  with the [Viggle turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) LoRA fused in, then decoded by
+  TAEQI2.1.
+- **img2img mode.** The StreamDiffusion recipe: the frame is noised to a mid-schedule sigma and denoised in 2-4 steps.
+  Faster, but with weak prompt adherence.
+- The prompt goes through the 8B VLM once per prompt change, never per frame.
 
 ```python
 from qwen_stream import StreamQwen
 
-stream = StreamQwen(512, 512, start_node=0.75)
-stream.set_prompt("a watercolor painting, soft pastel colors, paper texture")
+stream = StreamQwen(512, 512, schedule="edit-4")
+stream.set_prompt("Turn this photo into a watercolor painting.", reference=first_frame)  # img2img: no reference
 out = stream(frame)  # (H, W, 3) uint8 CUDA tensor in and out
 ```
 
 ## Benchmark
 
 ```bash
-python bench.py --video input.mp4 --frames 48 [--start-node 0.75] [--compile] [--fp8] [--max-memory-gb 24] --out out.mp4
+python bench.py --video input.mp4 --frames 48 [--edit --schedule edit-4] [--compile] [--fp8] [--max-memory-gb 24] --out out.mp4
 ```
 
 Prints per-stage latency and writes an `input | output` side-by-side video.
-Current numbers: 9.6 FPS at 512px with 3 steps (FP8, compiled) on an H100 PCIe within a 24 GB budget (see DESIGN.md).
+Current numbers at 512px, compiled with FP8, within a 24 GB budget on an H100 PCIe: edit mode 5.6 FPS at 4 steps,
+img2img 9.8 FPS at 3 steps (see DESIGN.md).
 
 ## Live camera demo
 

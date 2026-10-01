@@ -14,10 +14,15 @@ Open optimization ideas are `O<n>`. Measurements are from an H100 PCIe (the only
 
 ## Pipeline per frame
 
+Two modes. **Edit** (default) treats Qwen-Image 2.1 as the image-editing model it is. **img2img** is the
+StreamDiffusion-style SDEdit path.
+
 ```
-frame (H,W,3 uint8) -> TAEQI encode -> noise to sigma_start (fixed noise) -> k Euler steps of the DiT
-                    -> TAEQI decode -> frame
-prompt change       -> Qwen3-VL encode + prefill prefix K/V once
+edit:     frame -> TAEQI encode -> prefill prefix [instruction, frame as condition image] (D13, D14)
+                -> pure fixed noise -> 4-6 Euler steps on the target -> TAEQI decode
+img2img:  frame -> TAEQI encode -> noise to a mid-schedule sigma (fixed noise) -> 2-4 Euler steps -> TAEQI decode
+          (the text-only prefix is prefilled once per prompt)
+prompt change -> Qwen3-VL encode once (edit: with the current frame as the VLM's reference image)
 ```
 
 ## Decisions
@@ -51,7 +56,9 @@ A sweep on one frame (watercolor prompt, 512px):
 | 0.875 (0.92) | 4 | structure lost |
 | 1.0 | 6 | pure text-to-image (the prompt path works) |
 
-`set_start_node()` changes it at runtime. The usable range is narrow, and it is quantized to the student's nodes.
+Presets in `SCHEDULES` (`img2img-subtle/medium/strong`) pick the entry node at runtime. The usable range is narrow,
+and quantized to the student's nodes. **Prompt adherence is weak in this mode**: nothing but the noise level trades
+the frame against the prompt (no CFG, no RCFG). Edit mode (D13) fixes that.
 
 **D5. One fixed noise tensor for the whole stream.**
 StreamDiffusion does the same. With the same noise every frame, a static input gives a static output, which cuts
@@ -61,8 +68,7 @@ flicker. Cost: patterns in that noise stay fixed in screen space ("texture swimm
 Qwen-Image 2.1 modulates text tokens at t=0 (`causal_condition`) and text never attends to image tokens, so the text
 K/V are independent of the frame and the timestep. `set_prompt` runs Qwen3-VL (~0.3 s) and one `extract` pass. Every
 step of every frame then runs in `cached` mode, computing only the 1024 image tokens.
-This is also why the frame goes in as the SDEdit starting point and not as an edit-mode condition image: a condition
-image sits in the prefix, so the 8B VLM and the prefill would rerun on every frame (~6.6 TFLOP extra per frame).
+In edit mode the prefix contains the frame, so it is re-prefilled per frame (D13, D14); the VLM still runs once.
 
 **D7. No attention mask.**
 With one unpadded prompt the mask would be all ones. Passing `None` lets SDPA choose a fused kernel (FlashAttention-2
@@ -86,13 +92,12 @@ Load-time peak is still 14 GiB, because the model is loaded in bf16 first. Loadi
 that for 16 GB cards.
 
 **D11. Lean target-only forward for every cached step (`fast.py`).**
-`set_prompt` still uses the stock diffusers forward once, to prefill the prefix K/V. After that, each step runs
-`CachedDenoiser`. It precomputes the target-token rotary table (as real cos/sin) and the per-layer prefix K/V once,
-then runs `img_in` -> one shared modulation (all 32 blocks share it) -> 32 blocks -> `norm_out` / `proj_out`.
+Each step runs `CachedDenoiser`. It precomputes the target-token rotary table (as real cos/sin) once per prompt,
+takes the per-layer prefix K/V from the prefill (D14), then runs `img_in` -> one shared modulation (all 32 blocks share it) -> 32 blocks -> `norm_out` / `proj_out`.
 There is no data-dependent indexing and no host sync, so it compiles with `fullgraph=True`.
 - **Parity:** vs the diffusers cached forward, 0.6% relative difference (bf16 rounding over 32 layers).
 - **Cost:** about 50 lines that duplicate the block math. It has to track upstream changes to the 2.1 block.
-- **One instance for the stream's lifetime.** A prompt change swaps the prefix tensors (`set_prefix`).
+- **One instance for the stream's lifetime.** A prompt change swaps the per-prompt tensors (`set_layout`, `set_kv`).
   - torch.compile's automatic dynamic shapes generalize the prefix length after the second length seen.
   - Measured: the first two prompt lengths each compile once (~1 min). After that, a new length costs nothing extra,
     and steady speed is unchanged (~101 ms/frame).
@@ -114,10 +119,52 @@ There is no data-dependent indexing and no host sync, so it compiles with `fullg
   recorded per thread: running frames on `asyncio.to_thread`'s pool hung on the first frame.
 - **JPEG on the GPU.** `torchvision.io` decodes and encodes on the GPU (~1 ms per frame in total).
 - **Single user, by design.** `StreamQwen` holds one prompt cache. A new connection takes over from the old one
-  (page reloads, a second tab), and the page re-sends its prompt and strength on connect.
+  (page reloads, a second tab), and the page re-sends its mode, prompt and schedule on connect.
+- **Prompt changes apply on the next frame,** because edit mode needs a real frame as the VLM's reference (D13).
 - **Gated.** The page sits behind a random URL token, because it is exposed through a public quick tunnel.
 - **Measured locally, end to end:** 9.2 FPS with 103 ms of GPU work per frame, flat from 1 to 3 frames in flight.
   Before the single GPU thread, GIL contention pushed it from 104 to 129 ms.
+- **With edit mode (D13, D14), end to end:** edit-4 5.3 FPS (179 ms GPU), edit-6 3.9 FPS (249 ms), img2img-medium
+  9.1 FPS (104 ms). A prompt change takes ~5 s in edit mode and ~0.8 s in img2img (text encoder on CPU).
+
+**D13. Edit mode: the frame is the condition image and the prompt is an instruction; denoising starts from pure noise.**
+Qwen-Image 2.1 is an image-editing model, and the Viggle turbo LoRA was distilled on edits too. StreamDiffusion's
+RCFG self-negative exists only because SD-Turbo is text-to-image; here the edit training does that job.
+Sweep on frame 40 of the cat clip, eager bf16:
+
+| setting | adherence | structure | eager ms |
+|---|---|---|---|
+| img2img 0.75 (D4) | weak, mushy | partly lost | 171 |
+| **edit, pure noise (1.0)** | **excellent: real watercolor, real lego** | **pose and framing exact** | 416 (6 steps) |
+| edit, noised frame as start (0.875 and below) | none: near copy of the input | kept | 179-300 |
+
+- **Start from pure noise.** With the frame as both the condition and the starting point, the model reconstructs it,
+  so SDEdit and edit do not combine.
+- **Steps.** The student's 4-step training nodes `[1, .75, .5, .25]` (`edit-4`) look close to the card's 6-step
+  schedule (`edit-6`) on this clip; `edit-5` sits between.
+- **VLM once per prompt.** The DiT reads the condition image from its VAE latents; the VLM only shapes the text
+  tokens that follow the image. Reusing the embeddings from frame 0 on frame 40 changed the output by
+  0.26-0.34/255 (mean) vs re-running the VLM on frame 40. So the 8B VLM never runs per frame.
+- **The prompt changes cost more:** ~5 s on CPU, because the VLM now also processes the reference image (D9).
+- **Determinism.** The edit template picks its image label ("Picture"/"Image"/"图"/"图片") at random; it is pinned
+  to "Picture".
+- **Temporal behavior.** Fixed noise (D5) plus a condition frame gave a stable background and style across the clip,
+  and fine motion (the tongue) followed the input.
+
+**D14. Lean prefill (`CachedDenoiser.prefill`).**
+`set_layout` precomputes, once per prompt:
+- the text rows (`txt_in` of the prompt embeddings) and fixed scatter indices for the image rows;
+- the prefix rotary table and block-causal mask (causal, with the condition image bidirectional);
+- the t=0 modulation of the prefix, which is a constant.
+
+Per frame, `prefill` is then `img_in(frame)`, a scatter, and 32 blocks that emit K/V; compiled like D11.
+It also serves img2img (empty image part), so the diffusers forward is no longer used at runtime.
+- **Parity vs the diffusers `extract` pass:** prefix K/V within 1.1-2.6% per layer (bf16), first-step velocity
+  within 0.4% (img2img) and 0.6% (edit).
+- **Speed:** the diffusers prefill-plus-first-step pass took ~200 ms eager; the lean prefill is ~35 ms, about one
+  step. Edit at 4 steps went from 274 to 175 ms per frame.
+- **CUDA-graph buffers.** Graph outputs are reused by the next replay, so the prefill's K/V are cloned out right away
+  (~0.5 GB of copies per frame in edit mode, ~0.3 ms).
 
 ## Measurements (H100 PCIe, 512px, fused LoRA, 48 frames of a 24 fps clip)
 
@@ -131,6 +178,10 @@ There is no data-dependent indexing and no host sync, so it compiles with `fullg
 | lean forward (D11), eager, 24 GB cap | 3.5 ms | 171 ms | 3.6 ms | 178 ms | 5.6 |
 | lean forward, compiled, 24 GB cap | 2.6 ms | 127 ms | 2.8 ms | 132 ms | 7.6 |
 | **lean forward, compiled + FP8, 24 GB cap** | 2.7 ms | 98 ms | 2.9 ms | 104 ms | **9.6** |
+| edit-4 (D13), diffusers prefill, compiled + FP8 | 2.5 ms | 269 ms | 2.7 ms | 274 ms | 3.7 |
+| **edit-4, lean prefill (D14), compiled + FP8** | 1.8 ms | 175 ms | 1.9 ms | 179 ms | **5.6** |
+| edit-6, lean prefill, compiled + FP8 | 1.8 ms | 245 ms | 1.9 ms | 249 ms | 4.0 |
+| img2img-medium, lean prefill, compiled + FP8 | 2.6 ms | 97 ms | 2.9 ms | 102 ms | 9.8 |
 
 Per transformer pass (512px, 1024 tokens):
 
@@ -153,8 +204,7 @@ After compile, a bf16 pass is 37 ms of GPU time:
 That is near the bf16 limit of this card. The remaining levers are FP8/FP4 GEMMs (D10), fewer tokens (O4) and fewer
 steps (O5).
 
-**Quality is the open problem, not speed.** At start node 0.75, faces and fine structure get mushy with a generic
-style prompt (see D4).
+**Quality in img2img mode is weak** (D4); edit mode (D13) trades ~1.8x the per-frame cost for real prompt adherence.
 
 With `--compile`, the reported `set_prompt` time includes compile warmup (minutes), because the first compiled pass
 runs there.
@@ -180,7 +230,10 @@ Profile of one cached pass (eager, ~48 ms GPU):
   small cards.
 - **O4. Resolution and token count as a user-facing setting.** 384px (576 tokens) is about 0.55x the compute of 512.
   It is the most portable lever.
-- **O5. 1–2 step student.**
+- **O5. Fewer steps for edit mode.** It always starts from pure noise, so steps are the cost.
+  - Try Pruna's 5-step edit LoRA.
+  - Longer term, a 1-2 step edit student distilled for streaming (e.g. rCM or TwinFlow style).
+- **O5b. 1–2 step student (img2img).**
   - Retrain or distill a student whose low-noise nodes suit img2img (e.g. rCM or TwinFlow style).
   - Removes D4's narrow strength range and cuts NFE; the largest lever overall, but a training project.
 - **O6. Temporal consistency.** Try latent blending with the previous output, motion-aware start sigma
@@ -189,5 +242,8 @@ Profile of one cached pass (eager, ~48 ms GPU):
   - The local live server is D12.
   - On ZeroGPU the GPU is attached per call, so frames have to be processed in chunks per call rather than in a
     persistent loop.
+- **O9. Warmup time.** `live.py` compiles both layouts (img2img and edit) at two prompt lengths: ~11 min before the
+  first frame. Try torch.compile's persistent caches (inductor FX graph cache, `torch.compiler.save_cache_artifacts`)
+  or warming up only the default mode.
 - **O8. Multi-GPU pipeline parallelism** (StreamDiffusionV2): split the blocks across GPUs, with steps in flight.
   Only relevant beyond one card.

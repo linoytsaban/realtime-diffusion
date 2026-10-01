@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from qwen_stream import StreamQwen
+from qwen_stream.stream import SCHEDULES
 
 
 def read_frames(path, size, limit):
@@ -49,7 +50,8 @@ def main():
     parser.add_argument("--video", required=True)
     parser.add_argument("--prompt", default="a watercolor painting, soft pastel colors, paper texture")
     parser.add_argument("--size", type=int, default=512)
-    parser.add_argument("--start-node", type=float, default=0.75, choices=[1.0, 0.9375, 0.875, 0.75, 0.5, 0.25])
+    parser.add_argument("--schedule", default="img2img-medium", choices=list(SCHEDULES))
+    parser.add_argument("--edit", action="store_true", help="frame as condition image; the prompt is an instruction")
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--no-fuse", action="store_true")
     parser.add_argument("--compile", action="store_true")
@@ -63,11 +65,11 @@ def main():
         total = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
     stream = StreamQwen(
-        args.size, args.size, start_node=args.start_node, fuse_lora=not args.no_fuse,
+        args.size, args.size, schedule=args.schedule, fuse_lora=not args.no_fuse,
         text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile,
     )  # fmt: skip
-    _, prompt_ms = timed(stream.set_prompt, args.prompt)
     frames = read_frames(args.video, args.size, args.frames)
+    _, prompt_ms = timed(stream.set_prompt, args.prompt, frames[0] if args.edit else None)
 
     for frame in frames[:3]:  # warmup: cudnn autotune, compile
         stream(frame)
@@ -84,7 +86,7 @@ def main():
 
     nfe = len(stream.sigmas) - 1
     total = np.sum([np.median(v) for v in stages.values()])
-    print(f"{args.size}px, {nfe} NFE, fused={not args.no_fuse}, compile={args.compile}, fp8={args.fp8}")
+    print(f"{args.size}px, {args.schedule}, edit={args.edit}, {nfe} NFE, compile={args.compile}, fp8={args.fp8}")
     print(f"set_prompt (once per prompt): {prompt_ms:.0f} ms")
     for name, values in stages.items():
         print(f"  {name:8s} {np.median(values):7.1f} ms (median)")

@@ -46,12 +46,15 @@ class Session:
 
     def __init__(self):
         self.filter, self.use_filter, self.last_output = SimilarityFilter(), False, None
+        self.prompt, self.edit, self.prompt_changed = "", True, False
 
     def configure(self, settings):
-        if "prompt" in settings:
-            stream.set_prompt(settings["prompt"])
-        if "start_node" in settings:
-            stream.set_start_node(float(settings["start_node"]))
+        if "prompt" in settings or "mode" in settings:
+            self.prompt = settings.get("prompt", self.prompt)
+            self.edit = settings.get("mode", "edit" if self.edit else "img2img") == "edit"
+            self.prompt_changed = True  # applied on the next frame: edit mode needs one as the VLM's reference
+        if "schedule" in settings:
+            stream.set_schedule(settings["schedule"])
         if "filter" in settings:
             self.use_filter = bool(settings["filter"])
 
@@ -59,6 +62,9 @@ class Session:
         frame, t_io = timed(lambda: decode_jpeg(torch.frombuffer(bytearray(jpeg), dtype=torch.uint8), device="cuda"))
         frame = frame.permute(1, 2, 0)  # (H, W, 3)
         stats = {"skipped": False, "nfe": len(stream.sigmas) - 1}
+        if self.prompt_changed:
+            _, stats["prompt"] = timed(stream.set_prompt, self.prompt, frame if self.edit else None)
+            self.prompt_changed = False
         if self.use_filter and self.last_output is not None and self.filter.should_skip(frame):
             stats["skipped"] = True
             return self.last_output, stats
@@ -142,11 +148,12 @@ def main():
     def warmup():
         # Two prompt lengths, so compile has generalized the prefix length before anyone connects (D11).
         global stream
-        stream = StreamQwen(args.size, args.size, fp8=args.fp8, compile=args.compile)
+        stream = StreamQwen(args.size, args.size, schedule="edit-4", fp8=args.fp8, compile=args.compile)
         dummy = torch.zeros(args.size, args.size, 3, dtype=torch.uint8, device="cuda")
-        for prompt in ["a watercolor painting", "an oil painting with thick impasto brush strokes and warm evening light"]:
-            stream.set_prompt(prompt)
-            stream(dummy)
+        for reference in [None, dummy]:  # img2img and edit layouts
+            for prompt in ["a watercolor painting", "an oil painting with thick impasto brush strokes and warm evening light"]:
+                stream.set_prompt(prompt, reference)
+                stream(dummy)
 
     gpu_thread.submit(warmup).result()
     print(f"ready: http://127.0.0.1:{args.port}/?token={TOKEN}", flush=True)
