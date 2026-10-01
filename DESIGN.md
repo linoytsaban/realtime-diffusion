@@ -80,6 +80,8 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
   through the tunnel), one dedicated GPU thread (CUDA graphs are per thread), JPEG on the GPU, one user at a time
   (a new tab takes over), URL token gate.
 - **D8. Similarity filter** (StreamDiffusion): skips near-identical frames. Built, not yet measured live.
+- **D18. Gaze focus** (`focus.py`, `static/gaze.js`): the edit is limited to a soft disk where the viewer looks;
+  outside it the frame is restored after every step. Free on the GPU. Details and status in [GAZE.md](GAZE.md).
 
 ## Measurement notes
 
@@ -99,5 +101,5 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
 - **O5. Measure the similarity filter live**, and add motion-aware steps (StreamDiffusionV2).
 - **O6. Frame interpolation (RIFE)** for smoother displayed motion.
 - **O7. Persistent compile cache** to cut the ~11 min warmup.
-- **O8. Gaze-targeted edits** (being explored).
+- **O8. Gaze:** test with a real person, then name or segment the looked-at object ([GAZE.md](GAZE.md)).
 - **O9. ZeroGPU serving:** the GPU is attached per call, so frames would be processed in chunks.

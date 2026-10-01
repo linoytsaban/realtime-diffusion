@@ -8,6 +8,7 @@ from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_shift
 from huggingface_hub import hf_hub_download
 
 from .fast import CachedDenoiser, fuse_projections
+from .focus import restore_outside
 from .lora import apply_lora
 from .tiny_vae import TinyVAE
 
@@ -70,6 +71,7 @@ class StreamQwen:
         generator = torch.Generator(device).manual_seed(seed)
         self.noise = torch.randn(1, num_tokens, 64, generator=generator, device=device, dtype=torch.float32)
 
+        self.focus = None  # D18: optional (1, h*w, 1) mask; the edit is limited to it (see set_focus)
         # D11/D14: lean prefill and target-only steps, compiled once for the stream's lifetime.
         self.denoiser = CachedDenoiser(self.transformer, attention)
         compiled = lambda fn: torch.compile(fn, fullgraph=True, mode="reduce-overhead") if compile else fn
@@ -81,6 +83,10 @@ class StreamQwen:
         """Pick a `SCHEDULES` preset. Its first node is where denoising starts; 1.0 means pure noise."""
         self.scheduler.set_timesteps(sigmas=SCHEDULES[name], mu=self.mu, device=self.device)
         self.sigmas = self.scheduler.sigmas.float()  # shifted nodes plus the terminal 0
+
+    def set_focus(self, mask: torch.Tensor | None):
+        """D18: restrict the edit to `mask` (from `focus.focus_mask`), or None for the whole frame."""
+        self.focus = None if mask is None else mask.to(self.device, torch.float32)
 
     @torch.no_grad()
     def set_prompt(self, prompt: str, reference: torch.Tensor | None = None):
@@ -123,6 +129,8 @@ class StreamQwen:
         x = (1 - s0) * latents + s0 * self.noise
         for s, s_next in zip(self.sigmas[:-1], self.sigmas[1:]):
             x = x + (s_next - s) * self.step(x.to(self.dtype), s.view(1).to(self.dtype)).float()
+            if self.focus is not None:
+                x = restore_outside(x, latents, self.noise, s_next, self.focus)
         return x
 
     @torch.no_grad()

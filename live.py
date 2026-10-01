@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from torchvision.io import decode_jpeg, encode_jpeg
 
 from qwen_stream import SimilarityFilter, StreamQwen
+from qwen_stream.focus import focus_mask
 
 TOKEN = secrets.token_urlsafe(12)  # the page is reachable through a public tunnel, so gate it
 app = FastAPI()
@@ -57,6 +58,10 @@ class Session:
             stream.set_schedule(settings["schedule"])
         if "filter" in settings:
             self.use_filter = bool(settings["filter"])
+        if "focus" in settings:  # D18: {u, v, radius} as image fractions from the page's gaze tracker, or null
+            focus = settings["focus"]
+            mask = focus and focus_mask(focus["u"], focus["v"], focus["radius"], stream.latent_hw, device=stream.device)
+            stream.set_focus(mask)
 
     def process(self, jpeg: bytes):
         frame, t_io = timed(lambda: decode_jpeg(torch.frombuffer(bytearray(jpeg), dtype=torch.uint8), device="cuda"))
@@ -82,6 +87,11 @@ def index(token: str = ""):
     if token != TOKEN:
         raise HTTPException(403)
     return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+
+@app.get("/gaze.js")
+def gaze_js():
+    return FileResponse(Path(__file__).parent / "static" / "gaze.js", media_type="text/javascript")
 
 
 @app.websocket("/ws")
