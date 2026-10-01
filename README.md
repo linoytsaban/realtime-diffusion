@@ -16,7 +16,7 @@ comes out. Prototype stage. Every design choice and the optimization backlog are
 ```python
 from qwen_stream import StreamQwen
 
-stream = StreamQwen(512, 512, schedule="edit-4")
+stream = StreamQwen(512, 512, schedule="edit-3", fp8="row", compile=True)
 stream.set_prompt("Turn this photo into a watercolor painting.", reference=first_frame)  # img2img: no reference
 out = stream(frame)  # (H, W, 3) uint8 CUDA tensor in and out
 ```
@@ -24,17 +24,17 @@ out = stream(frame)  # (H, W, 3) uint8 CUDA tensor in and out
 ## Benchmark
 
 ```bash
-python bench.py --video input.mp4 --frames 48 [--edit --schedule edit-4] [--compile] [--fp8] [--max-memory-gb 24] --out out.mp4
+python bench.py --video input.mp4 --frames 48 [--edit --schedule edit-3] [--compile] [--fp8 row|tensor] [--max-memory-gb 24] --out out.mp4
 ```
 
 Prints per-stage latency and writes an `input | output` side-by-side video.
-Current numbers at 512px, compiled with FP8, within a 24 GB budget on an H100 PCIe: edit mode 5.6 FPS at 4 steps,
+Current numbers at 512px, compiled with FP8, within a 24 GB budget on an H100 PCIe: edit mode 7.5 FPS at 3 steps,
 img2img 9.8 FPS at 3 steps (see DESIGN.md).
 
 ## Live camera demo
 
 ```bash
-python live.py --fp8 --compile   # ~3 min warmup, then prints http://127.0.0.1:8765/?token=...
+python live.py --fp8 row --compile   # ~3 min warmup, then prints http://127.0.0.1:8765/?token=...
 ```
 
 Browsers only allow camera access on https or localhost. From a remote box, either forward the port

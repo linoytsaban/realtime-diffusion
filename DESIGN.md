@@ -140,8 +140,12 @@ Sweep on frame 40 of the cat clip, eager bf16:
 
 - **Start from pure noise.** With the frame as both the condition and the starting point, the model reconstructs it,
   so SDEdit and edit do not combine.
-- **Steps.** The student's 4-step training nodes `[1, .75, .5, .25]` (`edit-4`) look close to the card's 6-step
-  schedule (`edit-6`) on this clip; `edit-5` sits between.
+- **Steps.** Step sweep on the watercolor and lego instructions:
+  - `edit-3` = `[1, .75, .25]` (default) is nearly identical to `edit-4`; the lego is a touch softer.
+  - `[1, .5, .25]` is decent, with a little less detail.
+  - `[1, .75, .5]` is blurry, because it stops too early.
+  - 2 steps hold up for watercolor, but the lego falls apart.
+  - `edit-4` = `[1, .75, .5, .25]` is the student's training schedule; `edit-6` is the card's.
 - **VLM once per prompt.** The DiT reads the condition image from its VAE latents; the VLM only shapes the text
   tokens that follow the image. Reusing the embeddings from frame 0 on frame 40 changed the output by
   0.26-0.34/255 (mean) vs re-running the VLM on frame 40. So the 8B VLM never runs per frame.
@@ -166,6 +170,39 @@ It also serves img2img (empty image part), so the diffusers forward is no longer
 - **CUDA-graph buffers.** Graph outputs are reused by the next replay, so the prefill's K/V are cloned out right away
   (~0.5 GB of copies per frame in edit mode, ~0.3 ms).
 
+**D15. cuDNN attention for every unmasked attention call (`attention="cudnn"`; `"flash"` = FlashAttention-2).**
+In edit mode the steps attend over ~2072 keys, so attention is ~25% of the frame. Backends, measured on an idle GPU:
+- **cuDNN:** built into PyTorch, Ampere through Blackwell. -2 ms per step vs FA2.
+- **FlashAttention-3** (HF kernels Hub): Hopper only, so not a portable default. Untested end to end.
+- **SageAttention 2.2** (8-bit): wrong output on the 1048-key prefill shape (rel err 19.7), likely a block-size
+  edge case. Rejected unless padded.
+
+**D16. Exact split of the prefill attention.**
+The block-causal mask forces PyTorch's memory-efficient kernel. But the 1024 image rows see every key up to the end
+of the image block, so they need no mask: they run on the fast backend, and only the ~25 text rows keep the mask.
+The prefill went from 35.3 to 32.0 ms.
+
+**D17. Fused projections (`fuse_projections`).**
+Q/K/V become one GEMM and the MLP's gate/up become one, instead of 3 + 2 per block. This is done after the LoRA is
+fused and before FP8. The original layers are deleted (no duplicate weights), so the stock diffusers forward no
+longer runs on the transformer, and the unfused-LoRA hook path (D3) is offline-only. Gain: ~0.5 ms per pass.
+
+**FP8 granularity (D10).** Per-tensor scaling saves ~3 ms per frame over per-row (125.5 vs 128.4 ms denoise for
+edit-3). The images look equally good, with a mean difference of 4.2/255 that reads as a different rendering rather
+than an artifact. Per-row stays the default, as the safer choice for activation outliers; `--fp8 tensor` is opt-in.
+
+**Kernel sweep, edit-3 GPU time per frame (idle H100, CUDA graphs):**
+
+| variant | prefill | step | frame | step drift vs baseline |
+|---|---|---|---|---|
+| FP8 per-row, FA2, masked prefill (before) | 35.3 | 34.3 | 138.2 | - |
+| + cuDNN attention (D15) | 35.8 | 32.2 | 132.4 | 1.8% |
+| + split prefill (D16) | 32.0 | 31.9 | 127.8 | 2.1% |
+| + fused projections (D17) | 32.1 | 31.4 | 126.3 | 2.6% |
+| + FP8 per-tensor | 29.1 | 30.9 | 121.7 | - |
+
+The drift is the same order as FP8's own (1.4%) and not visible.
+
 ## Measurements (H100 PCIe, 512px, fused LoRA, 48 frames of a 24 fps clip)
 
 | config | encode | denoise | decode | total | FPS |
@@ -182,6 +219,8 @@ It also serves img2img (empty image part), so the diffusers forward is no longer
 | **edit-4, lean prefill (D14), compiled + FP8** | 1.8 ms | 175 ms | 1.9 ms | 179 ms | **5.6** |
 | edit-6, lean prefill, compiled + FP8 | 1.8 ms | 245 ms | 1.9 ms | 249 ms | 4.0 |
 | img2img-medium, lean prefill, compiled + FP8 | 2.6 ms | 97 ms | 2.9 ms | 102 ms | 9.8 |
+| **edit-3 + D15-D17, compiled + FP8 per-row** | 2.6 ms | 128 ms | 2.8 ms | 134 ms | **7.5** |
+| edit-3 + D15-D17, compiled + FP8 per-tensor | 2.6 ms | 126 ms | 2.8 ms | 131 ms | 7.6 |
 
 Per transformer pass (512px, 1024 tokens):
 
@@ -242,6 +281,10 @@ Profile of one cached pass (eager, ~48 ms GPU):
   - The local live server is D12.
   - On ZeroGPU the GPU is attached per call, so frames have to be processed in chunks per call rather than in a
     persistent loop.
+- **O10. More kernel work.**
+  - FA3 as a Hopper-only opt-in.
+  - SageAttention with padded key lengths (8-bit attention, Ada/Hopper; Sage3 FP4 on Blackwell).
+  - The FP8 GEMMs still run at ~40% of FP8 peak: try autotuned (max-autotune) GEMM templates.
 - **O9. Warmup time.** `live.py` compiles both layouts (img2img and edit) at two prompt lengths: ~11 min before the
   first frame. Try torch.compile's persistent caches (inductor FX graph cache, `torch.compiler.save_cache_artifacts`)
   or warming up only the default mode.

@@ -7,7 +7,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler, QwenImage21Pipeline
 from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_shift
 from huggingface_hub import hf_hub_download
 
-from .fast import CachedDenoiser
+from .fast import CachedDenoiser, fuse_projections
 from .lora import apply_lora
 from .tiny_vae import TinyVAE
 
@@ -19,6 +19,7 @@ SCHEDULES = {
     "img2img-subtle": [0.5, 0.25],
     "img2img-medium": [0.75, 0.5, 0.25],
     "img2img-strong": [0.875, 0.75, 0.5, 0.25],
+    "edit-3": [1.0, 0.75, 0.25],  # skips the .5 node; close to edit-4 in the step sweep (D13)
     "edit-4": [1.0, 0.75, 0.5, 0.25],  # the student's 4-step training nodes
     "edit-5": [1.0, 0.875, 0.75, 0.5, 0.25],
     "edit-6": TURBO_SIGMAS,  # the card's recommended schedule
@@ -31,12 +32,12 @@ class StreamQwen:
         width: int = 512,
         height: int = 512,
         schedule: str = "img2img-medium",
-        fuse_lora: bool = True,
         seed: int = 0,
         device: str = "cuda",
         text_encoder_device: str = "cpu",
-        fp8: bool = False,
+        fp8: str | None = None,
         compile: bool = False,
+        attention: str = "cudnn",
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
@@ -49,12 +50,14 @@ class StreamQwen:
         self.pipe.text_encoder.to(text_encoder_device)
         self.pipe.ref_token_list = ["Picture "]  # D13: the edit template otherwise picks its image label at random
         self.transformer = self.pipe.transformer.to(device)
-        # D3: the turbo LoRA is fused by default, trading a little precision for no per-layer LoRA matmuls.
-        apply_lora(self.transformer, hf_hub_download(*TURBO_LORA), fuse=fuse_lora)
-        if fp8:  # D10: FP8 weights and activations (Ada, Hopper, Blackwell); needs the LoRA fused first
-            from torchao.quantization import PerRow, float8_dynamic_activation_float8_weight, quantize_
+        # D3: the turbo LoRA is fused into the weights, trading a little precision for no per-layer LoRA matmuls.
+        apply_lora(self.transformer, hf_hub_download(*TURBO_LORA))
+        fuse_projections(self.transformer)  # D17; after the LoRA (it targets to_q/to_k/...), before FP8
+        if fp8:  # D10: FP8 weights and activations (Ada, Hopper, Blackwell), scaled per "row" or per "tensor"
+            from torchao.quantization import PerRow, PerTensor, float8_dynamic_activation_float8_weight, quantize_
 
-            quantize_(self.transformer.transformer_blocks, float8_dynamic_activation_float8_weight(granularity=PerRow()))
+            granularity = {"row": PerRow(), "tensor": PerTensor()}[fp8]
+            quantize_(self.transformer.transformer_blocks, float8_dynamic_activation_float8_weight(granularity=granularity))
         self.vae = TinyVAE.from_pretrained().to(device, dtype)
 
         # D2: turbo nodes get the pipeline's resolution-dependent time shift, computed by its own scheduler.
@@ -68,7 +71,7 @@ class StreamQwen:
         self.noise = torch.randn(1, num_tokens, 64, generator=generator, device=device, dtype=torch.float32)
 
         # D11/D14: lean prefill and target-only steps, compiled once for the stream's lifetime.
-        self.denoiser = CachedDenoiser(self.transformer)
+        self.denoiser = CachedDenoiser(self.transformer, attention)
         compiled = lambda fn: torch.compile(fn, fullgraph=True, mode="reduce-overhead") if compile else fn
         self.step, prefill = compiled(self.denoiser.__call__), compiled(self.denoiser.prefill)
         # CUDA graphs reuse their output buffers, and the prefix K/V must outlive later graph runs: copy them out.

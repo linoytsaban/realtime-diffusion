@@ -53,10 +53,10 @@ def main():
     parser.add_argument("--schedule", default="img2img-medium", choices=list(SCHEDULES))
     parser.add_argument("--edit", action="store_true", help="frame as condition image; the prompt is an instruction")
     parser.add_argument("--frames", type=int, default=64)
-    parser.add_argument("--no-fuse", action="store_true")
+    parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash"])
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--text-encoder-device", default="cpu")
-    parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling (D10)")
     parser.add_argument("--max-memory-gb", type=float, help="cap GPU memory to emulate a smaller card")
     parser.add_argument("--out", default="out.mp4")
     args = parser.parse_args()
@@ -65,7 +65,7 @@ def main():
         total = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
     stream = StreamQwen(
-        args.size, args.size, schedule=args.schedule, fuse_lora=not args.no_fuse,
+        args.size, args.size, schedule=args.schedule, attention=args.attention,
         text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile,
     )  # fmt: skip
     frames = read_frames(args.video, args.size, args.frames)

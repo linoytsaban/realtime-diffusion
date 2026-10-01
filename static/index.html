@@ -106,7 +106,7 @@ ws.onclose = (event) => { $("status").textContent = `disconnected ${event.reason
 const configure = (settings) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(settings));
 const MODES = {
   edit: { prompt: "Turn this photo into a watercolor painting with soft pastel colors and visible paper texture.",
-          schedules: [["edit-4", "4 steps (fastest)"], ["edit-5", "5 steps"], ["edit-6", "6 steps (best)"]] },
+          schedules: [["edit-3", "3 steps (fastest)"], ["edit-4", "4 steps"], ["edit-6", "6 steps (best)"]] },
   img2img: { prompt: "a watercolor painting, soft pastel colors, paper texture",
              schedules: [["img2img-subtle", "subtle (2 steps)"], ["img2img-medium", "medium (3 steps)"], ["img2img-strong", "strong (4 steps)"]] },
 };
