@@ -34,7 +34,7 @@ img2img 9.8 FPS at 3 steps (see DESIGN.md).
 ## Live camera demo
 
 ```bash
-python live.py --fp8 row --compile   # ~3 min warmup, then prints http://127.0.0.1:8765/?token=...
+python live.py --fp8 row --compile [--text-encoder-device cuda]   # ~11 min warmup, then prints the URL
 ```
 
 Browsers only allow camera access on https or localhost. From a remote box, either forward the port
