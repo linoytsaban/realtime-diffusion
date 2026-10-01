@@ -104,7 +104,7 @@ ws.onclose = (event) => { $("status").textContent = `disconnected ${event.reason
 
 const configure = (settings) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(settings));
 $("apply").onclick = () => { $("status").textContent = "encoding prompt..."; configure({ prompt: $("prompt").value }); };
-$("prompt").onkeydown = (event) => event.key === "Enter" && $("apply").click();
+$("prompt").onkeydown = (event) => { if (event.key === "Enter") $("apply").click(); };  // returning false would swallow keys
 $("strength").onchange = () => configure({ start_node: $("strength").value });
 $("filter").onchange = () => configure({ filter: $("filter").checked });
 
