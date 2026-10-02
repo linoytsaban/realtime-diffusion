@@ -1,6 +1,8 @@
-# qwen-stream
+# Qwen Stream
 
-Real-time camera editing with Qwen-Image 2.1, StreamDiffusion style. Design decisions and backlog: [DESIGN.md](DESIGN.md).
+Real-time interactive generation with Qwen Image 2.1 based on and inspired by [StreamDiffusion](https://github.com/cumulo-autumn/streamdiffusion) and [StreamDiffusion V2](https://github.com/chenfengxu714/StreamDiffusionV2).
+
+Design decisions and backlog: [DESIGN.md](DESIGN.md).
 
 - **Edit mode (default):** each frame is the condition image of an edit instruction, denoised in 3 steps with the
   [Viggle turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) LoRA and decoded by
