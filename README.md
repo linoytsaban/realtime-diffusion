@@ -8,7 +8,6 @@ Design decisions and backlog: [DESIGN.md](DESIGN.md).
   [Viggle turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) LoRA and decoded by
   [TAEQI2.1](https://huggingface.co/madebyollin/taeqi2_1). 7.5 FPS at 512px on an H100.
 - **img2img mode:** the StreamDiffusion recipe (noise the frame, denoise 2-4 steps). 9.8 FPS, weaker adherence.
-- **Gaze focus (experimental):** the edit follows where you look. See [GAZE.md](GAZE.md).
 
 ```python
 from qwen_stream import StreamQwen
@@ -33,12 +32,6 @@ python live.py --fp8 row --compile [--text-encoder-device cuda]   # ~11 min warm
 Camera access needs https or localhost: use `ssh -L 8765:127.0.0.1:8765 box`, or
 `touch empty.yml && cloudflared tunnel --config empty.yml --url http://127.0.0.1:8765`
 (the empty config avoids inheriting a system `config.yml` that 404s everything).
-
-## Tests
-
-```bash
-CUDA_VISIBLE_DEVICES= PYTHONPATH=. python tests/test_focus.py && node --test tests/
-```
 
 ## Requirements
 
