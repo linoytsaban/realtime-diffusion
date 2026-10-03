@@ -38,6 +38,7 @@ class StreamQwen:
         fp8: str | None = None,
         compile: bool = False,
         attention: str = "cudnn",
+        bottleneck: tuple | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
@@ -72,6 +73,8 @@ class StreamQwen:
 
         # D11/D14: lean prefill and target-only steps, compiled once for the stream's lifetime.
         self.denoiser = CachedDenoiser(self.transformer, attention)
+        if bottleneck:  # D19: (start, end[, upsample[, pool_prefix]]), see CachedDenoiser.set_bottleneck
+            self.denoiser.set_bottleneck(*bottleneck)
         compiled = lambda fn: torch.compile(fn, fullgraph=True, mode="reduce-overhead") if compile else fn
         self.step, prefill = compiled(self.denoiser.__call__), compiled(self.denoiser.prefill)
         # CUDA graphs reuse their output buffers, and the prefix K/V must outlive later graph runs: copy them out.

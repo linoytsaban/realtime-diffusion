@@ -74,6 +74,20 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
 - **D17. Fused projections.** One GEMM for Q/K/V and one for gate/up. The originals are deleted, so the stock
   diffusers forward no longer runs on the model. -0.5 ms per pass.
 - **D7. No attention mask in the steps.** A single unpadded prompt needs none.
+- **D19. Pooled middle blocks (`set_bottleneck`, off by default).** Training-free DiT-to-U-Net retrofit: blocks
+  `start..end-1` run on 2x2-pooled tokens, only their residual delta is upsampled. Fast but not usable without
+  calibration (edit-3, FP8, 5 photos x 4 prompts x 3 seeds, LPIPS vs dense; another seed of dense is 0.21):
+
+  | pooled blocks | FPS | LPIPS |
+  |---|---|---|
+  | none | 7.4 | 0 |
+  | 12-20 | 8.7 | 0.34 |
+  | 8-24 | 10.7 | 0.48 |
+  | 4-28 | 13.8 | 0.62 |
+
+  Faces and texture smear even at 12-20. One pooled block costs 0.02-0.06 (rounding noise: 0.003); blocks 1-2 and 31
+  are the worst, 20-23 the most tolerant. Nearest upsampling beats bilinear; pooling the condition image too is
+  better in the middle blocks, worse in the early ones.
 
 **Serving (`live.py`, `static/index.html`)**
 - **D12.** Newest frame wins (stale frames dropped), two frames in flight (hides network round trip: 9.5 vs 5.7 FPS
@@ -102,3 +116,4 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
 - **O8. Gaze-targeted edits.** Prototype removed after a first live test (gaze off target, edit not limited);
   it is in commit `fe19c86` (D18).
 - **O9. ZeroGPU serving:** the GPU is attached per call, so frames would be processed in chunks.
+- **O10. Calibrate D19:** a short finetune (~2.6k steps, as a LoRA) so pooled blocks 4-28 (13.8 FPS) match dense.

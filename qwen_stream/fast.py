@@ -10,6 +10,9 @@ Per call only tensor math remains:
 
 Kernel choices: cuDNN attention (D15), an unmasked split of the prefill attention (D16), fused projections (D17).
 
+Optional bottleneck (D19, `set_bottleneck`): the middle blocks run on 2x2-pooled image tokens, and only their residual
+delta is upsampled back onto the full-res stream (a training-free DiT-to-U-Net retrofit).
+
 One instance lives for the whole stream and is compiled once. A new prompt swaps the per-prompt tensors; the prefix
 length is the only shape that changes, and torch.compile's automatic dynamic shapes generalize it after the second
 length seen, so prompts of new lengths stop triggering recompiles.
@@ -45,6 +48,21 @@ class CachedDenoiser:
         # D15: the backend for unmasked attention (every step, and the image rows of the prefill). cuDNN runs on
         # Ampere through Blackwell and measured fastest here; "flash" (FlashAttention-2) is the PyTorch default.
         self.backend = {"cudnn": SDPBackend.CUDNN_ATTENTION, "flash": SDPBackend.FLASH_ATTENTION}[attention]
+        self.mid, self.layout = None, None
+
+    def set_bottleneck(self, start: int | None = None, end: int | None = None, upsample: str = "bilinear",
+                       pool_prefix: bool = True):
+        """D19: run blocks `start..end-1` on 2x2-pooled image tokens; None turns it off.
+
+        Blocks are residual, so the middle span only adds a delta to the stream. It is computed at 1/4 of the tokens and
+        upsampled (`upsample`: "nearest" or "bilinear"); the full-res stream itself passes through untouched. With
+        `pool_prefix` the condition image is pooled the same way in the prefill, otherwise the pooled target attends to
+        the full-res prefix K/V. Pooled tokens get rotary positions at the center of their 2x2 cell.
+        """
+        self.mid = None if start is None else (start, end)
+        self.upsample, self.pool_prefix = upsample, pool_prefix
+        if self.layout is not None:
+            self._set_coarse_layout()
 
     @torch.no_grad()
     def set_layout(self, prompt_embeds: torch.Tensor, img_mask: torch.Tensor, img_shapes):
@@ -76,6 +94,63 @@ class CachedDenoiser:
         # Prefix tokens are modulated from t = 0 (`causal_condition`), so their modulation is a constant.
         zero = torch.zeros(1, device=img_mask.device, dtype=self.text_hidden.dtype)
         self.prefix_modulation = self._modulation(t.time_text_embed(zero, self.text_hidden))
+        self.layout = (freqs, prefix_len, height, width)
+        if self.mid is not None:
+            self._set_coarse_layout()
+
+    def _set_coarse_layout(self):
+        """D19: rotary tables, mask and spans for the pooled middle blocks."""
+        freqs, prefix_len, height, width = self.layout
+        assert height % 2 == 0 and width % 2 == 0, "the bottleneck pools 2x2 tokens"
+        self.grid = (height, width)
+        frames = self.t.pos_embed.axes_dim[0] // 2  # complex rotary dims of the frame axis; height and width follow
+
+        def cell_centers(n):  # the pipeline's centered grid positions, averaged over each pair of rows or columns
+            return torch.arange(-(n - n // 2), n // 2, device=freqs.device).float().unflatten(0, (-1, 2)).mean(1)
+
+        def coarse_image(frame_freqs):  # (h/2 * w/2, D/2) rotary table of a pooled image block
+            theta, dim = self.t.pos_embed.theta, self.t.pos_embed.axes_dim[1]
+            inv = 1.0 / theta ** (torch.arange(0, dim, 2, device=freqs.device).float() / dim)
+            rows = torch.polar(torch.ones(1, device=freqs.device), cell_centers(height)[:, None] * inv)
+            cols = torch.polar(torch.ones(1, device=freqs.device), cell_centers(width)[:, None] * inv)
+            h2, w2 = height // 2, width // 2
+            return torch.cat([frame_freqs.expand(h2 * w2, -1), rows.repeat_interleave(w2, 0), cols.repeat(h2, 1)], dim=-1)
+
+        self.coarse_cos, self.coarse_sin = self._rope_table(coarse_image(freqs[prefix_len, :frames]))
+        self.coarse_span = None
+        if self.image_span is not None and self.pool_prefix:
+            a, b = self.image_span
+            image = coarse_image(freqs[a, :frames])
+            self.coarse_prefix_cos, self.coarse_prefix_sin = self._rope_table(torch.cat([freqs[:a], image, freqs[b:prefix_len]]))
+            n = image.shape[0]
+            is_image = torch.zeros(prefix_len - (b - a) + n, dtype=torch.bool, device=freqs.device)
+            is_image[a : a + n] = True
+            position = torch.arange(is_image.numel(), device=freqs.device)
+            block = torch.where(is_image, 0, -1 - position)
+            self.coarse_mask = (position[:, None] >= position[None]) | (block[:, None] == block[None])
+            self.coarse_span = (a, a + n)
+
+    def _pool(self, x):
+        """(1, h*w, C) -> (1, h/2 * w/2, C): 2x2 average pooling on the token grid."""
+        h, w = self.grid
+        return x.unflatten(1, (h // 2, 2, w // 2, 2)).float().mean((2, 4)).flatten(1, 2).to(x.dtype)
+
+    def _unpool(self, x):
+        """(1, h/2 * w/2, C) -> (1, h*w, C), nearest or bilinear."""
+        h, w = self.grid
+        grid = x.unflatten(1, (h // 2, w // 2))
+        if self.upsample == "nearest":
+            return grid[:, :, None, :, None].expand(-1, -1, 2, -1, 2, -1).reshape(x.shape[0], h * w, -1)
+        up = F.interpolate(grid.permute(0, 3, 1, 2), scale_factor=2, mode="bilinear", align_corners=False)
+        return up.permute(0, 2, 3, 1).flatten(1, 2)
+
+    def _pool_prefix(self, h):
+        a, b = self.image_span
+        return torch.cat([h[:, :a], self._pool(h[:, a:b]), h[:, b:]], dim=1)
+
+    def _unpool_prefix(self, delta):
+        a, b = self.coarse_span
+        return torch.cat([delta[:, :a], self._unpool(delta[:, a:b]), delta[:, b:]], dim=1)
 
     def set_kv(self, prefix_kv):
         """Point the cached steps at prefix K/V: one post-rope (B, S, H, D) pair per block."""
@@ -107,18 +182,18 @@ class CachedDenoiser:
         gate, up = block.img_mlp.gate_up(x).chunk(2, dim=-1)  # fused projection (D17)
         return block.img_mlp.out(F.silu(gate) * up)
 
-    def _attend(self, q, k, v, mask=None):
+    def _attend(self, q, k, v, mask=None, span=None):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         if mask is None:
             with sdpa_kernel([self.backend]):
                 out = F.scaled_dot_product_attention(q, k, v)
-        elif self.image_span is None:  # text-only prefix: a handful of tokens
+        elif span is None:  # text-only prefix: a handful of tokens
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         else:
             # D16, exact: the image rows see every key up to the end of the image with no mask, so they get the fast
             # backend; only the few text rows need the block-causal mask.
-            a, b = self.image_span
+            a, b = span
             with sdpa_kernel([self.backend]):
                 image = F.scaled_dot_product_attention(q[:, :, a:b], k[:, :, :b], v[:, :, :b])
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
@@ -135,12 +210,22 @@ class CachedDenoiser:
         if cond is not None:
             h[:, self.image_index] = t.img_in(cond)
         scale1, gate1, scale2, gate2 = self.prefix_modulation
+        start, end = self.mid if self.mid is not None and self.coarse_span is not None else (-1, -1)
         prefix_kv = []
-        for block in t.transformer_blocks:
-            q, k, v = self._qkv(block, h, scale1, self.prefix_cos, self.prefix_sin)
+        for i, block in enumerate(t.transformer_blocks):
+            if i == start:  # D19: enter the pooled middle; the full-res stream waits for its delta
+                full = h
+                h = entry = self._pool_prefix(h)
+            if start <= i < end:
+                cos, sin, mask, span = self.coarse_prefix_cos, self.coarse_prefix_sin, self.coarse_mask, self.coarse_span
+            else:
+                cos, sin, mask, span = self.prefix_cos, self.prefix_sin, self.prefix_mask, self.image_span
+            q, k, v = self._qkv(block, h, scale1, cos, sin)
             prefix_kv.append((k, v))
-            h = h + gate1 * block.attn.to_out[0](self._attend(q, k, v, self.prefix_mask))
+            h = h + gate1 * block.attn.to_out[0](self._attend(q, k, v, mask, span))
             h = h + gate2 * self._mlp(block, block.img_norm2(h) * (1 + scale2))
+            if i == end - 1:
+                h = full + self._unpool_prefix(h - entry)
         return prefix_kv
 
     def __call__(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -150,12 +235,19 @@ class CachedDenoiser:
         temb = t.time_text_embed(sigma, h)
         scale1, gate1, scale2, gate2 = self._modulation(temb)
 
-        for block, (k_prefix, v_prefix) in zip(t.transformer_blocks, self.prefix_kv):
-            q, k, v = self._qkv(block, h, scale1, self.cos, self.sin)
+        start, end = self.mid if self.mid is not None else (-1, -1)
+        for i, (block, (k_prefix, v_prefix)) in enumerate(zip(t.transformer_blocks, self.prefix_kv)):
+            if i == start:  # D19: enter the pooled middle; the full-res stream waits for its delta
+                full = h
+                h = entry = self._pool(h)
+            cos, sin = (self.coarse_cos, self.coarse_sin) if start <= i < end else (self.cos, self.sin)
+            q, k, v = self._qkv(block, h, scale1, cos, sin)
             k, v = torch.cat([k_prefix, k], dim=1), torch.cat([v_prefix, v], dim=1)
             # Target queries see the whole prefix and every target token, so no mask is needed (D7).
             h = h + gate1 * block.attn.to_out[0](self._attend(q, k, v))
             h = h + gate2 * self._mlp(block, block.img_norm2(h) * (1 + scale2))
+            if i == end - 1:
+                h = full + self._unpool(h - entry)
 
         h = t.norm_out(h, temb)
         return t.proj_out(h)

@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--text-encoder-device", default="cpu")
     parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling (D10)")
+    parser.add_argument("--bottleneck", help="D19: pooled middle blocks, e.g. 8,24 or 8,24,nearest,0")
     parser.add_argument("--max-memory-gb", type=float, help="cap GPU memory to emulate a smaller card")
     parser.add_argument("--out", default="out.mp4")
     args = parser.parse_args()
@@ -64,9 +65,13 @@ def main():
     if args.max_memory_gb:
         total = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
+    bottleneck = None
+    if args.bottleneck:
+        parts = args.bottleneck.split(",")
+        bottleneck = (int(parts[0]), int(parts[1]), *parts[2:3], *[bool(int(x)) for x in parts[3:4]])
     stream = StreamQwen(
         args.size, args.size, schedule=args.schedule, attention=args.attention,
-        text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile,
+        text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile, bottleneck=bottleneck,
     )  # fmt: skip
     frames = read_frames(args.video, args.size, args.frames)
     _, prompt_ms = timed(stream.set_prompt, args.prompt, frames[0] if args.edit else None)
@@ -86,7 +91,8 @@ def main():
 
     nfe = len(stream.sigmas) - 1
     total = np.sum([np.median(v) for v in stages.values()])
-    print(f"{args.size}px, {args.schedule}, edit={args.edit}, {nfe} NFE, compile={args.compile}, fp8={args.fp8}")
+    print(f"{args.size}px, {args.schedule}, edit={args.edit}, {nfe} NFE, compile={args.compile}, fp8={args.fp8}, "
+          f"bottleneck={bottleneck}")
     print(f"set_prompt (once per prompt): {prompt_ms:.0f} ms")
     for name, values in stages.items():
         print(f"  {name:8s} {np.median(values):7.1f} ms (median)")
