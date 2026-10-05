@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--text-encoder-device", default="cpu", help="cuda: faster prompt changes, +17.5 GB (D9)")
     parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash", "sage"], help="sage: Ada GPUs (D20)")
-    parser.add_argument("--lora", default="viggle", choices=["viggle", "pruna-8", "pruna-5"], help="few-step LoRA (D21)")
+    parser.add_argument("--lora", default="pruna-5", choices=["viggle", "pruna-8", "pruna-5"], help="few-step LoRA (D21)")
     parser.add_argument("--token", help="URL token; default: a new random one per start")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

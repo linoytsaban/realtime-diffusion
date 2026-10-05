@@ -33,11 +33,19 @@ SCHEDULES = {
     "pruna-8": [1.0, 14 / 15, 6 / 7, 10 / 13, 2 / 3, 6 / 11, 0.4, 2 / 9],
     "pruna-5": [1.0, 0.94, 6 / 7, 2 / 3, 0.4],
 }
-# D21: the edit presets as subsets of Pruna's 8-step nodes. edit-3 was compared against Viggle; 4 and 6 are untested.
+# D21: Pruna's edit presets are subsets of each LoRA's own nodes. edit-3 was compared by eye; 4 and 6 are untested,
+# and the 5-step LoRA's "edit-6" is its full 5-step schedule.
 PRUNA_EDIT = {
-    "edit-3": [1.0, 2 / 3, 2 / 9],
-    "edit-4": [1.0, 10 / 13, 6 / 11, 2 / 9],
-    "edit-6": [1.0, 14 / 15, 10 / 13, 2 / 3, 0.4, 2 / 9],
+    "pruna-8": {
+        "edit-3": [1.0, 10 / 13, 0.4],
+        "edit-4": [1.0, 10 / 13, 6 / 11, 2 / 9],
+        "edit-6": [1.0, 14 / 15, 10 / 13, 2 / 3, 0.4, 2 / 9],
+    },
+    "pruna-5": {
+        "edit-3": [1.0, 6 / 7, 0.4],
+        "edit-4": [1.0, 6 / 7, 2 / 3, 0.4],
+        "edit-6": [1.0, 0.94, 6 / 7, 2 / 3, 0.4],
+    },
 }
 
 
@@ -69,7 +77,7 @@ class StreamQwen:
         self.transformer = self.pipe.transformer.to(device)
         # D3: the turbo LoRA is fused into the weights, trading a little precision for no per-layer LoRA matmuls.
         lora_file, self.shift = LORAS[lora]
-        self.presets = {**SCHEDULES, **(PRUNA_EDIT if lora.startswith("pruna") else {})}
+        self.presets = {**SCHEDULES, **PRUNA_EDIT.get(lora, {})}
         apply_lora(self.transformer, hf_hub_download(*lora_file))
         fuse_projections(self.transformer)  # D17; after the LoRA (it targets to_q/to_k/...), before FP8
         if fp8:  # D10: FP8 weights and activations (Ada, Hopper, Blackwell), scaled per "row" or per "tensor"
