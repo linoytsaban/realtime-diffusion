@@ -14,7 +14,13 @@
   video, img { width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--panel); border-radius: 6px; transform: scaleX(-1); }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; max-width: 1100px; }
   input[type=text] { flex: 1 1 320px; padding: 8px; background: var(--panel); color: var(--fg); border: 1px solid #333; border-radius: 6px; }
-  select, button { padding: 8px; background: var(--panel); color: var(--fg); border: 1px solid #333; border-radius: 6px; }
+  select { padding: 8px; background: var(--panel); color: var(--fg); border: 1px solid #333; border-radius: 6px; }
+  button { padding: 8px 14px; font: 600 14px system-ui, sans-serif; color: #0b1620; background: var(--accent); border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; transition: filter 0.1s, transform 0.05s; }
+  button:hover { filter: brightness(1.12); }
+  button:active { transform: translateY(1px); filter: brightness(0.95); }
+  button:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  button.secondary { color: var(--accent); background: transparent; }
+  button.secondary:hover { background: rgb(124 196 255 / 0.12); filter: none; }
   label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; max-width: 1100px; }
   .stat { background: var(--panel); border-radius: 6px; padding: 8px; }
@@ -36,6 +42,7 @@
   </select>
   <input id="prompt" type="text">
   <button id="apply">Apply prompt</button>
+  <button id="shuffle" class="secondary" title="apply a random edit instruction">Shuffle prompt</button>
   <select id="schedule"></select>
   <label><input id="filter" type="checkbox"> skip similar frames</label>
 </div>
@@ -104,10 +111,20 @@ ws.onmessage = (event) => {
 ws.onclose = (event) => { $("status").textContent = `disconnected ${event.reason || ""}`; };
 
 const configure = (settings) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(settings));
+const SHUFFLE_PROMPTS = [  // edit-mode instructions
+  "Turn this image into a psychedelic portrait: swirling neon patterns in the background, floating eyes, flowers and geometric shapes around the person, saturated magenta, cyan and orange colors, with the person's face still recognizable.",
+  "Add a single floating blob of glowing deep blue light, soft amorphous shape, hovering just above the person's hand as if they are holding it, casting blue light on their fingers and face.",
+  "Turn the person into a marble statue in a museum, with soft gallery lighting.",
+  "Make it a 1990s anime frame, with cel shading, bold outlines and a pastel sky behind the person.",
+  "Turn the scene into a claymation set, with everything made of colorful modeling clay with visible fingerprints.",
+  "Make the person look like an astronaut inside a spaceship, with Earth visible through the window behind them.",
+  "Turn this into a stained-glass window, with thick black lead lines and glowing jewel-toned glass.",
+  "Make it look like an old 1920s photograph, sepia, grainy, with scratches and vignetting.",
+];
 const MODES = {
-  edit: { prompt: "Turn this photo into a watercolor painting with soft pastel colors and visible paper texture.",
+  edit: { prompt: SHUFFLE_PROMPTS[0],
           schedules: [["edit-3", "3 steps (fastest)"], ["edit-4", "4 steps"], ["edit-6", "6 steps (best)"]] },
-  img2img: { prompt: "a watercolor painting, soft pastel colors, paper texture",
+  img2img: { prompt: "a claymation scene made of colorful modeling clay, visible fingerprints",
              schedules: [["img2img-subtle", "subtle (2 steps)"], ["img2img-medium", "medium (3 steps)"], ["img2img-strong", "strong (4 steps)"]] },
 };
 function setMode(mode) {
@@ -118,6 +135,15 @@ function setMode(mode) {
 setMode("edit");
 const settings = () => ({ mode: $("mode").value, prompt: $("prompt").value, schedule: $("schedule").value, filter: $("filter").checked });
 $("apply").onclick = () => { $("status").textContent = "encoding prompt..."; configure({ prompt: $("prompt").value }); };
+$("shuffle").onclick = () => {
+  const options = SHUFFLE_PROMPTS.filter((p) => p !== $("prompt").value);
+  const prompt = options[Math.floor(Math.random() * options.length)];
+  const toEdit = $("mode").value !== "edit";
+  if (toEdit) { $("mode").value = "edit"; setMode("edit"); }
+  $("prompt").value = prompt;
+  $("status").textContent = "encoding prompt...";
+  configure(toEdit ? settings() : { prompt });
+};
 $("prompt").onkeydown = (event) => { if (event.key === "Enter") $("apply").click(); };  // returning false would swallow keys
 $("mode").onchange = () => { setMode($("mode").value); $("status").textContent = "encoding prompt..."; configure(settings()); };
 $("schedule").onchange = () => configure({ schedule: $("schedule").value });
