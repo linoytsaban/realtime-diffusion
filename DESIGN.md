@@ -47,6 +47,10 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
   - `edit-3` = `[1, .75, .25]` looks nearly identical to `edit-4`. Two steps break down on hard edits (lego).
   - The VLM runs once per prompt: reusing its output across frames changed the result by under 0.35/255.
   - The image label in the edit template is pinned to "Picture" (it is random upstream).
+- **D21. Pruna LoRA (`lora="pruna-8"`, `live.py --lora`).** Pruna's 8-step DMD LoRA run at 3 steps (1, 2/3, 2/9,
+  used as given, no resolution shift) looked better than Viggle at 3 steps on 5 photos x 4 edit prompts; same speed.
+  Live default since 2026-10-05. Its edit-4 and edit-6 presets are untested subsets of the 8-step nodes; img2img with
+  Pruna is untested.
 - **D4. img2img mode.** SDEdit from a turbo node (`img2img-subtle/medium/strong`). Fast but weak adherence:
   only the noise level trades frame against prompt.
 

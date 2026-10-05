@@ -13,6 +13,12 @@ from .tiny_vae import TinyVAE
 
 BASE_MODEL = "Qwen/Qwen-Image-2.1"
 TURBO_LORA = ("Viggle/Qwen-Image-2.1-viggle-turbo", "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors")
+# D21: few-step LoRAs. Viggle's nodes get the pipeline's resolution shift (D2); Pruna's are used exactly as given.
+LORAS = {
+    "viggle": (TURBO_LORA, True),
+    "pruna-8": (("PrunaAI/Pruna-Qwen-Image-2.1", "p_qwen_image_2.1_8step_v0.1.safetensors"), False),
+    "pruna-5": (("PrunaAI/Pruna-Qwen-Image-2.1", "p_qwen_image_2.1_5step_v0.1.safetensors"), False),
+}
 TURBO_SIGMAS = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]  # raw nodes of the turbo student (D2)
 # Raw-node schedules (D2). img2img enters mid-way (D4); edit always starts from pure noise (D13).
 SCHEDULES = {
@@ -23,6 +29,15 @@ SCHEDULES = {
     "edit-4": [1.0, 0.75, 0.5, 0.25],  # the student's 4-step training nodes
     "edit-5": [1.0, 0.875, 0.75, 0.5, 0.25],
     "edit-6": TURBO_SIGMAS,  # the card's recommended schedule
+    # Pruna (D21): the cards' full 8- and 5-step schedules
+    "pruna-8": [1.0, 14 / 15, 6 / 7, 10 / 13, 2 / 3, 6 / 11, 0.4, 2 / 9],
+    "pruna-5": [1.0, 0.94, 6 / 7, 2 / 3, 0.4],
+}
+# D21: the edit presets as subsets of Pruna's 8-step nodes. edit-3 was compared against Viggle; 4 and 6 are untested.
+PRUNA_EDIT = {
+    "edit-3": [1.0, 2 / 3, 2 / 9],
+    "edit-4": [1.0, 10 / 13, 6 / 11, 2 / 9],
+    "edit-6": [1.0, 14 / 15, 10 / 13, 2 / 3, 0.4, 2 / 9],
 }
 
 
@@ -38,6 +53,7 @@ class StreamQwen:
         fp8: str | None = None,
         compile: bool = False,
         attention: str = "cudnn",
+        lora: str = "viggle",
         bottleneck: tuple | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ):
@@ -52,7 +68,9 @@ class StreamQwen:
         self.pipe.ref_token_list = ["Picture "]  # D13: the edit template otherwise picks its image label at random
         self.transformer = self.pipe.transformer.to(device)
         # D3: the turbo LoRA is fused into the weights, trading a little precision for no per-layer LoRA matmuls.
-        apply_lora(self.transformer, hf_hub_download(*TURBO_LORA))
+        lora_file, self.shift = LORAS[lora]
+        self.presets = {**SCHEDULES, **(PRUNA_EDIT if lora.startswith("pruna") else {})}
+        apply_lora(self.transformer, hf_hub_download(*lora_file))
         fuse_projections(self.transformer)  # D17; after the LoRA (it targets to_q/to_k/...), before FP8
         if fp8:  # D10: FP8 weights and activations (Ada, Hopper, Blackwell), scaled per "row" or per "tensor"
             from torchao.quantization import PerRow, PerTensor, float8_dynamic_activation_float8_weight, quantize_
@@ -63,6 +81,10 @@ class StreamQwen:
 
         # D2: turbo nodes get the pipeline's resolution-dependent time shift, computed by its own scheduler.
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(self.pipe.scheduler.config, shift_terminal=None)
+        if not self.shift:  # D21: Pruna's nodes are used as given
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                self.pipe.scheduler.config, use_dynamic_shifting=False, shift=1.0, shift_terminal=None
+            )
         cfg = self.scheduler.config
         self.mu = calculate_shift(num_tokens, cfg.base_image_seq_len, cfg.max_image_seq_len, cfg.base_shift, cfg.max_shift)
         self.set_schedule(schedule)
@@ -82,7 +104,7 @@ class StreamQwen:
 
     def set_schedule(self, name: str):
         """Pick a `SCHEDULES` preset. Its first node is where denoising starts; 1.0 means pure noise."""
-        self.scheduler.set_timesteps(sigmas=SCHEDULES[name], mu=self.mu, device=self.device)
+        self.scheduler.set_timesteps(sigmas=self.presets[name], mu=self.mu if self.shift else None, device=self.device)
         self.sigmas = self.scheduler.sigmas.float()  # shifted nodes plus the terminal 0
 
     @torch.no_grad()
