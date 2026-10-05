@@ -23,6 +23,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+try:  # D20: SageAttention's Triton kernel (INT8 Q/K), as an opaque op so torch.compile and CUDA graphs accept it
+    from sageattention import sageattn_qk_int8_pv_fp16_triton
+
+    @torch.library.custom_op("qwen_stream::sage_attention", mutates_args=())
+    def sage_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """(B, H, N, D) like SDPA, unmasked."""
+        return sageattn_qk_int8_pv_fp16_triton(q.contiguous(), k.contiguous(), v.contiguous(), tensor_layout="HND")
+
+    @sage_attention.register_fake
+    def _(q, k, v):
+        return q.new_empty(q.shape)  # contiguous, like the kernel's output
+
+except ImportError:
+    sage_attention = None
+
 
 def fuse_projections(transformer):
     """D17: one GEMM for Q/K/V and one for the MLP's gate/up, instead of three and two. Run before FP8 quantization.
@@ -47,7 +62,9 @@ class CachedDenoiser:
         self.t = transformer
         # D15: the backend for unmasked attention (every step, and the image rows of the prefill). cuDNN runs on
         # Ampere through Blackwell and measured fastest here; "flash" (FlashAttention-2) is the PyTorch default.
-        self.backend = {"cudnn": SDPBackend.CUDNN_ATTENTION, "flash": SDPBackend.FLASH_ATTENTION}[attention]
+        # D20: "sage" is SageAttention's Triton kernel, aimed at Ada (RTX 4090); slower than cuDNN on Hopper.
+        assert attention != "sage" or sage_attention is not None, "attention='sage' needs the sageattention package"
+        self.backend = {"cudnn": SDPBackend.CUDNN_ATTENTION, "flash": SDPBackend.FLASH_ATTENTION, "sage": None}[attention]
         self.mid, self.layout = None, None
 
     def set_bottleneck(self, start: int | None = None, end: int | None = None, upsample: str = "bilinear",
@@ -182,11 +199,16 @@ class CachedDenoiser:
         gate, up = block.img_mlp.gate_up(x).chunk(2, dim=-1)  # fused projection (D17)
         return block.img_mlp.out(F.silu(gate) * up)
 
+    def _unmasked(self, q, k, v):
+        if self.backend is None:
+            return sage_attention(q, k, v)
+        with sdpa_kernel([self.backend]):
+            return F.scaled_dot_product_attention(q, k, v)
+
     def _attend(self, q, k, v, mask=None, span=None):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         if mask is None:
-            with sdpa_kernel([self.backend]):
-                out = F.scaled_dot_product_attention(q, k, v)
+            out = self._unmasked(q, k, v)
         elif span is None:  # text-only prefix: a handful of tokens
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
@@ -194,8 +216,7 @@ class CachedDenoiser:
             # D16, exact: the image rows see every key up to the end of the image with no mask, so they get the fast
             # backend; only the few text rows need the block-causal mask.
             a, b = span
-            with sdpa_kernel([self.backend]):
-                image = F.scaled_dot_product_attention(q[:, :, a:b], k[:, :, :b], v[:, :, :b])
+            image = self._unmasked(q[:, :, a:b], k[:, :, :b], v[:, :, :b])
             with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
                 text_q = torch.cat([q[:, :, :a], q[:, :, b:]], dim=2)
                 text = F.scaled_dot_product_attention(text_q, k, v, attn_mask=torch.cat([mask[:a], mask[b:]]))

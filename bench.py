@@ -53,7 +53,7 @@ def main():
     parser.add_argument("--schedule", default="img2img-medium", choices=list(SCHEDULES))
     parser.add_argument("--edit", action="store_true", help="frame as condition image; the prompt is an instruction")
     parser.add_argument("--frames", type=int, default=64)
-    parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash"])
+    parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash", "sage"])
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--text-encoder-device", default="cpu")
     parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling (D10)")

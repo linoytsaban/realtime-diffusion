@@ -67,8 +67,13 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
 - **D14. Lean prefill.** Per frame: `img_in(frame)`, a scatter into fixed slots, 32 blocks emitting K/V.
   ~32 ms vs ~200 ms through diffusers. Within 0.6% of diffusers. Outputs are cloned out of CUDA-graph buffers.
 - **D15. cuDNN attention** for unmasked calls (`attention="cudnn"`, or `"flash"`). Portable from Ampere to
-  Blackwell, -2 ms per step vs FlashAttention-2. SageAttention 2.2 was wrong on the prefill shape; FA3 is
+  Blackwell, -2 ms per step vs FlashAttention-2. SageAttention's CUDA builds failed (D20); FA3 is
   Hopper-only.
+- **D20. SageAttention (`attention="sage"`), for the RTX 4090.** SageAttention's Triton kernel (INT8 Q/K), wrapped
+  as a custom op so it compiles and records in CUDA graphs. LPIPS 0.010 vs cuDNN (mean of 20 edits; max 0.023),
+  not visible. Slower on the H100 (158.7 vs 134.6 ms per frame); its gain is expected on Ada, not yet measured.
+  The CUDA builds failed: pip `sageattention` 2.2.0 gives wrong output here, and `kernels-community/sage-attention`
+  launches outside the current stream, so CUDA-graph replays skip it (NaN).
 - **D16. Exact split of the prefill attention.** Image rows need no mask, so they use the fast kernel; only ~25 text
   rows keep the mask. -3 ms.
 - **D17. Fused projections.** One GEMM for Q/K/V and one for gate/up. The originals are deleted, so the stock
@@ -107,11 +112,12 @@ Compiled, FP8 per-row, cuDNN attention. GPU memory: 14 GB with the text encoder 
 
 - **O1. Fewer edit steps.** A 1-2 step edit student (rCM or TwinFlow style). Biggest lever; a training project.
 - **O2. NVFP4 on Blackwell** (RTX Pro 6000, 5090, Spark).
-- **O3. Faster GEMMs.** Autotuned FP8 GEMM templates; FA3 as a Hopper opt-in; SageAttention with padded keys.
+- **O3. Faster GEMMs.** Autotuned FP8 GEMM templates; FA3 as a Hopper opt-in; measure SageAttention (D20) on a 4090.
 - **O4. Partial prefill** (FluxRT-style): recompute only changed frame tokens. Gain is capped at the prefill share
   (~20%), and it is an approximation.
 - **O5. Measure the similarity filter live**, and add motion-aware steps (StreamDiffusionV2).
-- **O6. Frame interpolation (RIFE)** for smoother displayed motion.
+- **O6. Frame interpolation (RIFE): dropped.** Smoother (~5 ms per extra frame) but adds ~140 ms delay, since it
+  waits for the next frame; delay matters more for a live camera.
 - **O7. Persistent compile cache** to cut the ~11 min warmup.
 - **O8. Gaze-targeted edits.** Prototype removed after a first live test (gaze off target, edit not limited);
   it is in commit `fe19c86` (D18).
