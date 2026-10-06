@@ -1,0 +1,14 @@
+torch>=2.8
+torchvision
+torchao>=0.10
+diffusers @ git+https://github.com/huggingface/diffusers
+transformers>=5
+huggingface_hub
+safetensors
+av
+pillow
+numpy
+fastapi
+uvicorn
+# optional: attention="sage" (RTX 4090)
+# sageattention
