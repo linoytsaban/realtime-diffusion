@@ -1,52 +1,56 @@
-# Qwen Stream
+# Realtime Diffusion
 
-Real-time, instruction-based editing of a live camera feed with [Qwen-Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1).
-Type an edit like "Turn the person into a marble statue" and watch it applied to your webcam at ~7 FPS.
+Real-time, instruction-based editing of a live camera feed with few-step diffusion models.
+Type an edit like "Turn the person into a marble statue" and watch it applied to your webcam in real time.
 
 Based on and inspired by [StreamDiffusion](https://github.com/cumulo-autumn/streamdiffusion) and
 [StreamDiffusionV2](https://github.com/chenfengxu714/StreamDiffusionV2).
+
+**Models**
+- **Qwen-Image 2.1** (`StreamQwen`) - ~7 FPS edit / ~10 FPS img2img at 512px on one H100.
 
 <!-- demo clip goes here -->
 
 ## How it works
 
 ```
-camera frame -> tiny VAE -> prefill [instruction + frame] -> 3 denoising steps -> tiny VAE -> browser
+camera frame -> tiny VAE -> prefill [instruction + frame] -> few denoising steps -> tiny VAE -> browser
 ```
 
 - **Edit mode (default):** each frame is the condition image of an edit instruction. Pose and motion follow the
   camera; the instruction decides the look.
-- **Few steps:** the [Pruna 5-step LoRA](https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1), run at 3 steps.
-  The [Viggle turbo LoRA](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) is an option.
-- **Fast ends:** [TAEQI2.1](https://huggingface.co/madebyollin/taeqi2_1) encodes and decodes in ~2 ms each.
+- **Few steps:** a few-step LoRA run at 2-3 steps. For Qwen-Image 2.1 the options include the
+  [Pruna 5-step LoRA](https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1), the
+  [Viggle turbo LoRA](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo), and our own DMD-distilled LoRAs.
+- **Fast ends:** a tiny VAE ([TAEQI2.1](https://huggingface.co/madebyollin/taeqi2_1) for Qwen) encodes and decodes in
+  ~2 ms each.
 - **Fast middle:** the instruction is encoded once per prompt; each step runs a lean, compiled forward with CUDA
   graphs and FP8 weights.
 - **img2img mode:** the classic StreamDiffusion recipe (noise the frame, denoise 2-4 steps). Faster, but follows the
   prompt less closely.
 
-Every non-obvious choice is written up, with measurements, in [DESIGN.md](DESIGN.md).
-
 ## Performance
 
-One H100 PCIe, 512px, compiled, FP8:
+Qwen-Image 2.1, one H100 PCIe, 512px, compiled, FP8:
 
 | mode | GPU ms per frame | FPS |
 |---|---|---|
 | edit, 3 steps (default) | 134 | ~7 |
 | img2img, 3 steps | 91-97 | ~10 |
 
-Other GPUs are not measured yet. The design targets a 24 GB RTX 4090 (text encoder on CPU, ~14 GB on the GPU).
+Other GPUs are not measured yet. The design targets a 24 GB RTX 4090 (text encoder on CPU, ~14 GB on the GPU) and the
+RTX Pro 6000 (96 GB) used by ZeroGPU Spaces.
 
 ## Install
 
 Needs a CUDA GPU and Python 3.10+.
 
 ```bash
-git clone https://github.com/linoytsaban/qwen-stream && cd qwen-stream
+git clone https://github.com/linoytsaban/realtime-diffusion && cd realtime-diffusion
 pip install -r requirements.txt
 ```
 
-Weights (~31 GB, mostly the DiT and the text encoder) download from the Hugging Face Hub on first run.
+Weights download from the Hugging Face Hub on first run.
 
 ## Live camera demo
 
@@ -97,7 +101,7 @@ Prints per-stage latency and writes an input | output comparison video. `--img2i
 ## Limitations
 
 - Fixed noise keeps a still scene still, but its patterns stay fixed in screen space.
-- The Pruna LoRA was trained at 1024px; at 512px and 3 steps it is outside its training setup and was chosen by eye.
+- Few-step LoRAs trained at a different resolution than they run at are outside their training setup.
 - Prompt changes take ~5 s with the text encoder on CPU.
 
 ## License
