@@ -9,9 +9,7 @@ Based on and inspired by [StreamDiffusion](https://github.com/cumulo-autumn/stre
 **Models**
 - **Qwen-Image 2.1** (`StreamQwen`) with our [2-step DMD2 LoRA](https://huggingface.co/linoyts/Qwen-Image-2.1-DMD2-2steps) - ~9.5 FPS edit / ~10 FPS img2img at 512px on one H100.
 
-[![Qwen Image 2.1 Realtime with the 2-step LoRA](assets/demo_poster.jpg)](assets/demo.mp4)
-
-*Click to play the video.*
+[![Qwen Image 2.1 Realtime with the 2-step LoRA](assets/demo.gif)](assets/demo.mp4)
 
 ## Two ways to try it
 
