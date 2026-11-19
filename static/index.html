@@ -36,7 +36,7 @@
 </div>
 
 <div class="controls">
-  <select id="mode" title="edit: the frame is the condition image (D13); img2img: the frame is noised (D4)">
+  <select id="mode" title="edit: the frame is the condition image; img2img: the frame is noised">
     <option value="edit" selected>edit (instruction)</option>
     <option value="img2img">img2img (description)</option>
   </select>
@@ -123,7 +123,7 @@ const SHUFFLE_PROMPTS = [  // edit-mode instructions
 ];
 const MODES = {
   edit: { prompt: SHUFFLE_PROMPTS[0],
-          schedules: [["edit-3", "3 steps (fastest)"], ["edit-4", "4 steps"], ["edit-6", "6 steps (best)"]] },
+          schedules: [["edit-2", "2 steps (default)"], ["edit-3", "3 steps"], ["edit-4", "4 steps"], ["edit-6", "6 steps"]] },
   img2img: { prompt: "a claymation scene made of colorful modeling clay, visible fingerprints",
              schedules: [["img2img-subtle", "subtle (2 steps)"], ["img2img-medium", "medium (3 steps)"], ["img2img-strong", "strong (4 steps)"]] },
 };

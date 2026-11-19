@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from qwen_stream import StreamQwen
-from qwen_stream.stream import LORAS, SCHEDULES
+from qwen_stream.stream import LORAS
 
 
 def read_frames(path, size, limit):
@@ -50,16 +50,15 @@ def main():
     parser.add_argument("--video", required=True)
     parser.add_argument("--prompt", default="Turn the scene into a claymation set, with everything made of colorful modeling clay.")
     parser.add_argument("--size", type=int, default=512)
-    parser.add_argument("--schedule", default="edit-3", choices=list(SCHEDULES))
+    parser.add_argument("--schedule", default="edit-2", help="SCHEDULES entry, or the LoRA's own preset")
     parser.add_argument("--img2img", action="store_true", help="noise the frame instead of using it as the condition "
                         "image; the prompt is a description (pair with an img2img-* schedule)")
-    parser.add_argument("--lora", default="pruna-5", choices=list(LORAS), help="few-step LoRA (D21)")
+    parser.add_argument("--lora", default="dmd2-2step", choices=list(LORAS))
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash", "sage"])
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--text-encoder-device", default="cpu")
-    parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling (D10)")
-    parser.add_argument("--bottleneck", help="D19: pooled middle blocks, e.g. 8,24 or 8,24,nearest,0")
+    parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling")
     parser.add_argument("--max-memory-gb", type=float, help="cap GPU memory to emulate a smaller card")
     parser.add_argument("--out", default="out.mp4")
     args = parser.parse_args()
@@ -67,13 +66,9 @@ def main():
     if args.max_memory_gb:
         total = torch.cuda.get_device_properties(0).total_memory / 2**30
         torch.cuda.set_per_process_memory_fraction(args.max_memory_gb / total)
-    bottleneck = None
-    if args.bottleneck:
-        parts = args.bottleneck.split(",")
-        bottleneck = (int(parts[0]), int(parts[1]), *parts[2:3], *[bool(int(x)) for x in parts[3:4]])
     stream = StreamQwen(
         args.size, args.size, schedule=args.schedule, attention=args.attention,
-        text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile, bottleneck=bottleneck,
+        text_encoder_device=args.text_encoder_device, fp8=args.fp8, compile=args.compile,
         lora=args.lora,
     )  # fmt: skip
     frames = read_frames(args.video, args.size, args.frames)
@@ -95,7 +90,7 @@ def main():
     nfe = len(stream.sigmas) - 1
     total = np.sum([np.median(v) for v in stages.values()])
     print(f"{args.size}px, {args.schedule}, lora={args.lora}, img2img={args.img2img}, {nfe} NFE, compile={args.compile}, "
-          f"fp8={args.fp8}, bottleneck={bottleneck}")
+          f"fp8={args.fp8}")
     print(f"set_prompt (once per prompt): {prompt_ms:.0f} ms")
     for name, values in stages.items():
         print(f"  {name:8s} {np.median(values):7.1f} ms (median)")

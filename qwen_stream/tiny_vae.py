@@ -1,6 +1,6 @@
 """TAEQI2.1: madebyollin's tiny autoencoder for Qwen-Image 2.1 (16x spatial, 64 latent channels, RGBA).
 
-Self-contained port of the `f16` variant of https://github.com/madebyollin/taesd (see DESIGN.md, D4).
+Self-contained port of the `f16` variant of https://github.com/madebyollin/taesd.
 Layer indices match the published `taeqi2_1.safetensors` keys, so the file loads with only a prefix rename.
 """
 

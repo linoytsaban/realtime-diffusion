@@ -1,6 +1,6 @@
 torch>=2.8
 torchvision
-torchao>=0.10
+torchao>=0.10  # only for fp8
 diffusers @ git+https://github.com/huggingface/diffusers
 transformers>=5
 huggingface_hub

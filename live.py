@@ -18,13 +18,14 @@ from fastapi.responses import FileResponse
 from torchvision.io import decode_jpeg, encode_jpeg
 
 from qwen_stream import SimilarityFilter, StreamQwen
+from qwen_stream.stream import LORAS
 
 TOKEN = secrets.token_urlsafe(12)  # the page is reachable through a public tunnel, so gate it
 app = FastAPI()
 stream: StreamQwen = None
 gpu_lock = asyncio.Lock()  # one stream at a time: StreamQwen holds a single prompt cache
 active = {"ws": None}  # the connection holding the stream; a new one takes over (page reloads, a second tab)
-# D12: all GPU work runs on this one thread. torch.compile's CUDA graphs are recorded per thread, so warmup and
+# All GPU work runs on this one thread. torch.compile's CUDA graphs are recorded per thread, so warmup and
 # every frame must share it; a thread pool that hops threads re-records or hangs.
 gpu_thread = ThreadPoolExecutor(max_workers=1)
 
@@ -101,7 +102,7 @@ async def websocket(ws: WebSocket, token: str = ""):
         await ws.send_text(json.dumps({"size": stream.latent_hw[0] * 16}))
 
         async def receive():
-            # D12: keep only the newest frame and the newest settings; stale frames are dropped, never queued.
+            # Keep only the newest frame and the newest settings; stale frames are dropped, never queued.
             while True:
                 message = await ws.receive()
                 if message["type"] == "websocket.disconnect":
@@ -140,11 +141,12 @@ async def websocket(ws: WebSocket, token: str = ""):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", type=int, default=512)
-    parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling (D10)")
+    parser.add_argument("--fp8", choices=["row", "tensor"], help="FP8 DiT with per-row or per-tensor scaling")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--text-encoder-device", default="cpu", help="cuda: faster prompt changes, +17.5 GB (D9)")
-    parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash", "sage"], help="sage: Ada GPUs (D20)")
-    parser.add_argument("--lora", default="pruna-5", choices=["viggle", "pruna-8", "pruna-5"], help="few-step LoRA (D21)")
+    parser.add_argument("--text-encoder-device", default="cpu", help="cuda: faster prompt changes, +17.5 GB")
+    parser.add_argument("--attention", default="cudnn", choices=["cudnn", "flash", "sage"], help="sage: Ada GPUs")
+    parser.add_argument("--lora", default="dmd2-2step", choices=list(LORAS))
+    parser.add_argument("--schedule", default="edit-2", help="starting schedule; switchable in the UI")
     parser.add_argument("--token", help="URL token; default: a new random one per start")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -152,9 +154,9 @@ def main():
     TOKEN = args.token or TOKEN
 
     def warmup():
-        # Two prompt lengths, so compile has generalized the prefix length before anyone connects (D11).
+        # Two prompt lengths, so compile has generalized the prefix length before anyone connects.
         global stream
-        stream = StreamQwen(args.size, args.size, schedule="edit-3", fp8=args.fp8, compile=args.compile,
+        stream = StreamQwen(args.size, args.size, schedule=args.schedule, fp8=args.fp8, compile=args.compile,
                              text_encoder_device=args.text_encoder_device, attention=args.attention, lora=args.lora)
         dummy = torch.zeros(args.size, args.size, 3, dtype=torch.uint8, device="cuda")
         for reference in [None, dummy]:  # img2img and edit layouts

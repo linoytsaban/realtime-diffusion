@@ -1,4 +1,6 @@
-"""StreamDiffusion-style img2img streaming for Qwen-Image 2.1. Decision numbers (D1...) refer to DESIGN.md."""
+"""Real-time streaming edit and img2img for Qwen-Image 2.1."""
+
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -12,41 +14,34 @@ from .lora import apply_lora
 from .tiny_vae import TinyVAE
 
 BASE_MODEL = "Qwen/Qwen-Image-2.1"
-TURBO_LORA = ("Viggle/Qwen-Image-2.1-viggle-turbo", "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors")
-# D21: few-step LoRAs. Viggle's nodes get the pipeline's resolution shift (D2); Pruna's are used exactly as given.
-LORAS = {
-    "viggle": (TURBO_LORA, True),
-    "pruna-8": (("PrunaAI/Pruna-Qwen-Image-2.1", "p_qwen_image_2.1_8step_v0.1.safetensors"), False),
-    "pruna-5": (("PrunaAI/Pruna-Qwen-Image-2.1", "p_qwen_image_2.1_5step_v0.1.safetensors"), False),
-}
-TURBO_SIGMAS = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]  # raw nodes of the turbo student (D2)
-# Raw-node schedules (D2). img2img enters mid-way (D4); edit always starts from pure noise (D13).
+
+
+class LoRA(NamedTuple):
+    weights: tuple[str, str]  # (Hub repo, file)
+    shift: bool  # True: schedule nodes get the pipeline's resolution-dependent shift; False: used exactly as given
+    presets: dict = {}  # this LoRA's own versions of SCHEDULES entries, or extra entries
+
+
+# Schedules are raw sigma nodes. Edit starts from pure noise (1.0); img2img enters mid-way from the noised frame.
 SCHEDULES = {
+    "edit-2": [1.0, 0.5],  # the 2-step LoRA's training nodes (default)
+    "edit-3": [1.0, 0.75, 0.25],
+    "edit-4": [1.0, 0.75, 0.5, 0.25],
+    "edit-6": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25],  # Viggle's 6-step nodes
     "img2img-subtle": [0.5, 0.25],
     "img2img-medium": [0.75, 0.5, 0.25],
     "img2img-strong": [0.875, 0.75, 0.5, 0.25],
-    "edit-3": [1.0, 0.75, 0.25],  # skips the .5 node; close to edit-4 in the step sweep (D13)
-    "edit-4": [1.0, 0.75, 0.5, 0.25],  # the student's 4-step training nodes
-    "edit-5": [1.0, 0.875, 0.75, 0.5, 0.25],
-    "edit-6": TURBO_SIGMAS,  # the card's recommended schedule
-    # Pruna (D21): the cards' full 8- and 5-step schedules
-    "pruna-8": [1.0, 14 / 15, 6 / 7, 10 / 13, 2 / 3, 6 / 11, 0.4, 2 / 9],
-    "pruna-5": [1.0, 0.94, 6 / 7, 2 / 3, 0.4],
 }
-# D21: Pruna's edit presets are subsets of each LoRA's own nodes. edit-3 was compared by eye; 4 and 6 are untested,
-# and the 5-step LoRA's "edit-6" is its full 5-step schedule.
-PRUNA_EDIT = {
-    "pruna-8": {
-        "edit-3": [1.0, 10 / 13, 0.4],
-        "edit-4": [1.0, 10 / 13, 6 / 11, 2 / 9],
-        "edit-6": [1.0, 14 / 15, 10 / 13, 2 / 3, 0.4, 2 / 9],
-    },
-    "pruna-5": {
-        "edit-3": [1.0, 6 / 7, 0.4],
-        "edit-4": [1.0, 6 / 7, 2 / 3, 0.4],
-        "edit-6": [1.0, 0.94, 6 / 7, 2 / 3, 0.4],
-    },
-}
+# Few-step LoRAs that can be fused into the transformer.
+PRUNA, PRUNA_SIGMAS = "PrunaAI/P-Q-Image-2.1", [1.0, 0.925, 0.85, 0.625, 0.375, 0.125]  # v0.2, the card's schedule
+LORAS = {
+    "dmd2-2step": LoRA(("linoyts/Qwen-Image-2.1-DMD2-2steps", "pytorch_lora_weights_v1_5.safetensors"), shift=False),
+    "pruna-6": LoRA((PRUNA, "p_q_image_2.1_6_steps_v0.2.safetensors"), shift=True, presets={"edit-6": PRUNA_SIGMAS}),
+    "pruna-6-upsampled": LoRA((PRUNA, "p_q_image_2.1_6_steps_upsampled_v0.2.safetensors"), shift=True,
+                              presets={"edit-6": PRUNA_SIGMAS}),
+    "viggle": LoRA(("Viggle/Qwen-Image-2.1-viggle-turbo", "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors"), shift=True),
+    "lightx2v": LoRA(("lightx2v/Qwen-Image-2.1-Lightning", "pytorch_lora_weights.safetensors"), shift=True),
+}  # fmt: skip
 
 
 class StreamQwen:
@@ -54,42 +49,41 @@ class StreamQwen:
         self,
         width: int = 512,
         height: int = 512,
-        schedule: str = "edit-3",
+        schedule: str = "edit-2",
         seed: int = 0,
         device: str = "cuda",
         text_encoder_device: str = "cpu",
         fp8: str | None = None,
         compile: bool = False,
         attention: str = "cudnn",
-        lora: str = "pruna-5",
-        bottleneck: tuple | None = None,
+        lora: str = "dmd2-2step",
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.device, self.text_encoder_device, self.dtype = device, text_encoder_device, dtype
         self.latent_hw = (height // 16, width // 16)
         num_tokens = self.latent_hw[0] * self.latent_hw[1]
 
-        # D1: the full VAE is never loaded, TAEQI2.1 does both ends.
+        # The full VAE is never loaded: the tiny VAE does both ends.
         self.pipe = QwenImage21Pipeline.from_pretrained(BASE_MODEL, vae=None, torch_dtype=dtype)
-        # D9: only the DiT lives on the GPU by default; the 8B text encoder runs once per prompt wherever it is put.
+        # Only the DiT has to live on the GPU; the 8B text encoder runs once per prompt wherever it is put.
         self.pipe.text_encoder.to(text_encoder_device)
-        self.pipe.ref_token_list = ["Picture "]  # D13: the edit template otherwise picks its image label at random
+        self.pipe.ref_token_list = ["Picture "]  # the edit template otherwise picks its image label at random
         self.transformer = self.pipe.transformer.to(device)
-        # D3: the turbo LoRA is fused into the weights, trading a little precision for no per-layer LoRA matmuls.
-        lora_file, self.shift = LORAS[lora]
-        self.presets = {**SCHEDULES, **PRUNA_EDIT.get(lora, {})}
-        apply_lora(self.transformer, hf_hub_download(*lora_file))
-        fuse_projections(self.transformer)  # D17; after the LoRA (it targets to_q/to_k/...), before FP8
-        if fp8:  # D10: FP8 weights and activations (Ada, Hopper, Blackwell), scaled per "row" or per "tensor"
+        # The LoRA is fused into the weights: a little precision traded for no per-layer LoRA matmuls.
+        weights, self.shift, presets = LORAS[lora]
+        self.presets = {**SCHEDULES, **presets}
+        apply_lora(self.transformer, hf_hub_download(*weights))
+        fuse_projections(self.transformer)  # after the LoRA (it targets to_q/to_k/...), before FP8
+        if fp8:  # FP8 weights and activations (Ada, Hopper, Blackwell), scaled per "row" or per "tensor"
             from torchao.quantization import PerRow, PerTensor, float8_dynamic_activation_float8_weight, quantize_
 
             granularity = {"row": PerRow(), "tensor": PerTensor()}[fp8]
             quantize_(self.transformer.transformer_blocks, float8_dynamic_activation_float8_weight(granularity=granularity))
         self.vae = TinyVAE.from_pretrained().to(device, dtype)
 
-        # D2: turbo nodes get the pipeline's resolution-dependent time shift, computed by its own scheduler.
+        # Shifted LoRAs get the pipeline's resolution-dependent time shift, computed by its own scheduler.
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(self.pipe.scheduler.config, shift_terminal=None)
-        if not self.shift:  # D21: Pruna's nodes are used as given
+        if not self.shift:
             self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
                 self.pipe.scheduler.config, use_dynamic_shifting=False, shift=1.0, shift_terminal=None
             )
@@ -97,21 +91,19 @@ class StreamQwen:
         self.mu = calculate_shift(num_tokens, cfg.base_image_seq_len, cfg.max_image_seq_len, cfg.base_shift, cfg.max_shift)
         self.set_schedule(schedule)
 
-        # D5: one fixed noise sample for the whole stream.
+        # One fixed noise sample for the whole stream, so a still scene stays still.
         generator = torch.Generator(device).manual_seed(seed)
         self.noise = torch.randn(1, num_tokens, 64, generator=generator, device=device, dtype=torch.float32)
 
-        # D11/D14: lean prefill and target-only steps, compiled once for the stream's lifetime.
+        # Lean prefill and target-only steps, compiled once for the stream's lifetime.
         self.denoiser = CachedDenoiser(self.transformer, attention)
-        if bottleneck:  # D19: (start, end[, upsample[, pool_prefix]]), see CachedDenoiser.set_bottleneck
-            self.denoiser.set_bottleneck(*bottleneck)
         compiled = lambda fn: torch.compile(fn, fullgraph=True, mode="reduce-overhead") if compile else fn
         self.step, prefill = compiled(self.denoiser.__call__), compiled(self.denoiser.prefill)
         # CUDA graphs reuse their output buffers, and the prefix K/V must outlive later graph runs: copy them out.
         self.prefill = lambda *cond: [(k.clone(), v.clone()) for k, v in prefill(*cond)]
 
     def set_schedule(self, name: str):
-        """Pick a `SCHEDULES` preset. Its first node is where denoising starts; 1.0 means pure noise."""
+        """Pick a schedule preset (`SCHEDULES`, or the LoRA's own). Its first node is where denoising starts; 1.0 means pure noise."""
         self.scheduler.set_timesteps(sigmas=self.presets[name], mu=self.mu if self.shift else None, device=self.device)
         self.sigmas = self.scheduler.sigmas.float()  # shifted nodes plus the terminal 0
 
@@ -119,8 +111,8 @@ class StreamQwen:
     def set_prompt(self, prompt: str, reference: torch.Tensor | None = None):
         """Encode the prompt once per prompt change.
 
-        Without `reference` (img2img, D6): the prefix is text only, so its K/V are prefilled here, once.
-        With a reference frame (edit, D13): the frame is the condition image. The VLM sees `reference` once, and every
+        Without `reference` (img2img): the prefix is text only, so its K/V are prefilled here, once.
+        With a reference frame (edit): the frame is the condition image. The VLM sees `reference` once, and every
         frame then re-prefills the prefix with its own latents in the condition-image slots (see `denoise`).
         """
         self.edit = reference is not None
@@ -146,9 +138,9 @@ class StreamQwen:
 
     @torch.no_grad()
     def denoise(self, latents: torch.Tensor) -> torch.Tensor:
-        """D2/D4: noise the frame's latents to the start node, then Euler-integrate the velocity to 0.
+        """Noise the frame's latents to the start node, then Euler-integrate the velocity to 0.
 
-        In edit mode (D13) the clean frame latents are also the condition image, so the prefix is prefilled per frame.
+        In edit mode the clean frame latents are also the condition image, so the prefix is prefilled per frame.
         """
         if self.edit:
             self.denoiser.set_kv(self.prefill(latents.to(self.dtype)))
@@ -170,7 +162,7 @@ class StreamQwen:
 
 
 class SimilarityFilter:
-    """D8: StreamDiffusion's Stochastic Similarity Filter.
+    """StreamDiffusion's Stochastic Similarity Filter.
 
     Skips a frame with probability max(0, (sim - threshold) / (1 - threshold)), where `sim` is the cosine similarity
     to the last frame that was actually processed. A static camera then costs almost nothing.
@@ -183,6 +175,8 @@ class SimilarityFilter:
         small = F.interpolate(frame.permute(2, 0, 1)[None].float(), size=self.size, mode="area").flatten()
         if self.reference is not None:
             sim = F.cosine_similarity(small, self.reference, dim=0).item()
+            if not small.any() and not self.reference.any():  # two black frames (cosine of zero vectors is 0)
+                sim = 1.0
             if torch.rand(1).item() < (sim - self.threshold) / (1 - self.threshold):
                 return True
         self.reference = small
